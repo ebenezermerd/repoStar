@@ -12,7 +12,7 @@ from rich import box
 
 from .filters import IssueAnalysis
 
-console = Console()
+console = Console(width=160)
 
 
 def complexity_color(score: float) -> str:
@@ -123,18 +123,18 @@ def display_issue_detail(analysis: IssueAnalysis):
 
 def display_results_table(results: list[IssueAnalysis], title: str = "Issue Analysis Results"):
     """Display a summary table of all analyzed issues."""
-    table = Table(title=title, box=box.ROUNDED, show_lines=True)
-    table.add_column("#", width=4, justify="right")
-    table.add_column("Repository", style="cyan", max_width=25)
-    table.add_column("Issue", max_width=40)
-    table.add_column("PR", width=6, justify="right")
-    table.add_column("Stars", justify="right", width=7)
-    table.add_column("Size MB", justify="right", width=8)
-    table.add_column("Py Files", justify="right", width=8)
-    table.add_column("+/-", justify="right", width=10)
-    table.add_column("Pure", width=5)
-    table.add_column("Score", justify="right", width=7)
-    table.add_column("Status", width=8)
+    table = Table(title=title, box=box.ROUNDED, show_lines=True, expand=False)
+    table.add_column("#", min_width=3, justify="right")
+    table.add_column("Repository", style="cyan", min_width=20, max_width=30)
+    table.add_column("Issue", min_width=25, max_width=45)
+    table.add_column("PR", min_width=5, justify="right")
+    table.add_column("Stars", justify="right", min_width=7)
+    table.add_column("Size", justify="right", min_width=6)
+    table.add_column("Py", justify="right", min_width=3)
+    table.add_column("+/-", justify="right", min_width=10)
+    table.add_column("Pure", min_width=4)
+    table.add_column("Score", justify="right", min_width=5)
+    table.add_column("Status", min_width=6)
 
     for i, a in enumerate(results, 1):
         status = Text("PASS", style="bold green") if a.meets_criteria else Text("FAIL", style="bold red")

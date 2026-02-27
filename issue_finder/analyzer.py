@@ -33,8 +33,15 @@ class IssueAnalyzer:
         self.min_substantial = min_substantial
 
     def analyze_issue(self, owner: str, repo: str, issue_number: int,
-                      repo_info: Optional[dict] = None) -> IssueAnalysis:
-        """Fully analyze an issue against all criteria."""
+                      repo_info: Optional[dict] = None,
+                      issue_data: Optional[dict] = None,
+                      early_reject: bool = True) -> IssueAnalysis:
+        """Fully analyze an issue against all criteria.
+
+        Args:
+            issue_data: Pre-fetched issue data from list endpoint to avoid extra API call.
+            early_reject: If True, skip expensive API calls when cheap checks fail.
+        """
         analysis = IssueAnalysis(owner=owner, repo=repo, issue_number=issue_number)
 
         if repo_info is None:
@@ -55,7 +62,11 @@ class IssueAnalyzer:
                 f"Repo size ({analysis.repo_size_mb:.1f}MB) exceeds maximum ({self.max_size_mb}MB)"
             )
 
-        issue_data = self.client.get_issue(owner, repo, issue_number)
+        if early_reject and analysis.rejection_reasons:
+            return analysis
+
+        if issue_data is None:
+            issue_data = self.client.get_issue(owner, repo, issue_number)
         if not issue_data:
             analysis.rejection_reasons.append("Issue not found")
             return analysis
@@ -86,6 +97,9 @@ class IssueAnalyzer:
 
         if not analysis.issue_body or len(analysis.issue_body.strip()) < 30:
             analysis.rejection_reasons.append("Issue description is too short or empty")
+
+        if early_reject and analysis.rejection_reasons:
+            return analysis
 
         pr_number = self._find_linked_pr(owner, repo, issue_number, issue_data)
         if pr_number is None:
@@ -327,9 +341,12 @@ class IssueAnalyzer:
                 issue_count += 1
 
                 issue_number = issue_data["number"]
-                logger.info("  Analyzing issue #%d: %s", issue_number, issue_data.get("title", ""))
+                logger.info("  Analyzing issue #%d: %s", issue_number, issue_data.get("title", "")[:60])
 
-                analysis = self.analyze_issue(owner, repo_name, issue_number, repo_info=repo_data)
+                analysis = self.analyze_issue(
+                    owner, repo_name, issue_number,
+                    repo_info=repo_data, issue_data=issue_data, early_reject=True,
+                )
 
                 if analysis.meets_criteria and analysis.complexity_score >= min_complexity:
                     results.append(analysis)
@@ -372,7 +389,10 @@ class IssueAnalyzer:
             issue_number = issue_data["number"]
             logger.info("Analyzing issue #%d: %s", issue_number, issue_data.get("title", "")[:60])
 
-            analysis = self.analyze_issue(owner, repo, issue_number, repo_info=repo_info)
+            analysis = self.analyze_issue(
+                owner, repo, issue_number,
+                repo_info=repo_info, issue_data=issue_data, early_reject=True,
+            )
             results.append(analysis)
 
             if analysis.meets_criteria:
@@ -386,5 +406,5 @@ class IssueAnalyzer:
 
     def analyze_specific_issue(self, owner: str, repo: str,
                                issue_number: int) -> IssueAnalysis:
-        """Analyze a single specific issue in detail."""
-        return self.analyze_issue(owner, repo, issue_number)
+        """Analyze a single specific issue in detail (no early rejection)."""
+        return self.analyze_issue(owner, repo, issue_number, early_reject=False)

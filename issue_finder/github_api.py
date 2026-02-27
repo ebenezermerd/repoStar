@@ -11,7 +11,7 @@ import requests
 logger = logging.getLogger(__name__)
 
 DEFAULT_PER_PAGE = 100
-RATE_LIMIT_BUFFER = 50
+RATE_LIMIT_BUFFER = 10
 BACKOFF_MULTIPLIER = 1.5
 
 
