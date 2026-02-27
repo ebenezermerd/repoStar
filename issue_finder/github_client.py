@@ -28,7 +28,7 @@ class GitHubClient:
         params: dict[str, Any] | None = None,
         accept_header: str | None = None,
     ) -> Any:
-        command: list[str] = [self.gh_path, "api", endpoint]
+        command: list[str] = [self.gh_path, "api", endpoint, "--method", "GET"]
         if accept_header:
             command.extend(["-H", f"Accept: {accept_header}"])
 
