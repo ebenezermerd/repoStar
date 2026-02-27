@@ -197,3 +197,27 @@ class GitHubClient:
                 break
 
         return files
+
+    def search_merged_pull_requests_referencing_issue(
+        self,
+        owner: str,
+        repo: str,
+        issue_number: int,
+        *,
+        page_size: int = 20,
+    ) -> list[dict[str, Any]]:
+        query = f"repo:{owner}/{repo} is:pr is:merged #{issue_number}"
+        payload = self._run_api(
+            "search/issues",
+            params={
+                "q": query,
+                "per_page": page_size,
+                "page": 1,
+            },
+        )
+        if not isinstance(payload, dict):
+            return []
+        items = payload.get("items")
+        if not isinstance(items, list):
+            return []
+        return items

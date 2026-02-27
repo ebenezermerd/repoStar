@@ -182,31 +182,41 @@ class IssueFinder:
             return None
 
         linked_pull_numbers = self._extract_linked_pull_numbers(timeline)
-        if len(linked_pull_numbers) != 1:
+        search_pull_numbers = self._search_pull_numbers_referencing_issue(
+            repository.owner, repository.name, issue_number
+        )
+        pull_numbers = dedupe_preserve_order(linked_pull_numbers + search_pull_numbers)
+        if not pull_numbers:
             self._reject("linked_pull_count")
             return None
 
-        pull_number = linked_pull_numbers[0]
-        try:
-            pull_payload = self.client.get_pull_request(
-                repository.owner, repository.name, pull_number
+        valid_pull_payloads: list[dict[str, Any]] = []
+        for pull_number in pull_numbers:
+            try:
+                pull_payload = self.client.get_pull_request(
+                    repository.owner, repository.name, pull_number
+                )
+            except GitHubClientError:
+                self._reject("pull_fetch")
+                continue
+
+            if pull_payload.get("merged_at") is None:
+                continue
+
+            closing_refs = extract_closing_issue_numbers(
+                pull_payload.get("body") or "",
+                owner=repository.owner,
+                repo=repository.name,
             )
-        except GitHubClientError:
-            self._reject("pull_fetch")
+            if closing_refs == [issue_number]:
+                valid_pull_payloads.append(pull_payload)
+
+        if len(valid_pull_payloads) != 1:
+            self._reject("pull_match_count")
             return None
 
-        if pull_payload.get("merged_at") is None:
-            self._reject("pull_not_merged")
-            return None
-
-        closing_refs = extract_closing_issue_numbers(
-            pull_payload.get("body") or "",
-            owner=repository.owner,
-            repo=repository.name,
-        )
-        if closing_refs != [issue_number]:
-            self._reject("pull_closing_references")
-            return None
+        pull_payload = valid_pull_payloads[0]
+        pull_number = int(pull_payload["number"])
 
         try:
             pull_files = self.client.get_pull_files(
@@ -316,6 +326,27 @@ class IssueFinder:
                             pull_numbers.append(maybe_number)
 
         return dedupe_preserve_order(pull_numbers)
+
+    def _search_pull_numbers_referencing_issue(
+        self, owner: str, repo: str, issue_number: int
+    ) -> list[int]:
+        try:
+            results = self.client.search_merged_pull_requests_referencing_issue(
+                owner, repo, issue_number
+            )
+        except GitHubClientError:
+            self._reject("pull_search")
+            return []
+
+        numbers: list[int] = []
+        for item in results:
+            number = item.get("number")
+            if isinstance(number, int):
+                numbers.append(number)
+            elif isinstance(number, str) and number.isdigit():
+                numbers.append(int(number))
+
+        return dedupe_preserve_order(numbers)
 
     @staticmethod
     def _pull_number_from_url(url: str) -> int | None:
