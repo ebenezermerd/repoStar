@@ -31,10 +31,10 @@ class FinderConfig:
     min_single_python_file_changes: int = 35
     min_issue_body_length: int = 80
     min_complexity_score: float = 50.0
-    max_repositories: int = 30
-    max_repo_search_pages: int = 2
-    issues_per_repository: int = 50
-    max_issue_pages: int = 2
+    max_repositories: int = 10
+    max_repo_search_pages: int = 1
+    issues_per_repository: int = 30
+    max_issue_pages: int = 1
     max_timeline_pages: int = 1
     max_pull_file_pages: int = 4
     include_forks: bool = False

@@ -80,8 +80,8 @@ python run_issue_finder.py --top 20 --json-out output/candidates.json
 - `--min-python-files 4`
 - `--min-single-file-changes 35`
 - `--min-complexity-score 50`
-- `--issues-per-repository 50`
-- `--max-repositories 30`
+- `--issues-per-repository 30`
+- `--max-repositories 10`
 - `--show-rejections`
 
 Run full help:
@@ -89,6 +89,15 @@ Run full help:
 ```bash
 python run_issue_finder.py --help
 ```
+
+## Rate-limit note
+
+GitHub API rate limits can be hit on large scans. Start with smaller values:
+
+- `--max-repositories 5`
+- `--issues-per-repository 20`
+
+Then increase gradually if needed.
 
 ## Tests
 
