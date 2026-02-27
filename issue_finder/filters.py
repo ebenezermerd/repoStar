@@ -1,22 +1,13 @@
 """Filtering logic for issues, PRs, and file changes."""
 
 import re
-import logging
 from dataclasses import dataclass, field
 from typing import Optional
-
-logger = logging.getLogger(__name__)
 
 IMAGE_PATTERN = re.compile(
     r'!\[.*?\]\(.*?\)'           # markdown images ![alt](url)
     r'|<img\s[^>]*>'            # HTML img tags
     r'|https?://\S+\.(?:png|jpg|jpeg|gif|svg|webp|bmp|ico)\b',  # direct image URLs
-    re.IGNORECASE,
-)
-
-LINK_PATTERN = re.compile(
-    r'https?://\S+'              # any HTTP(S) URL
-    r'|\[.*?\]\(https?://.*?\)', # markdown links [text](url)
     re.IGNORECASE,
 )
 
@@ -199,67 +190,3 @@ def analyze_file_changes(pr_files: list[dict]) -> list[FileChangeInfo]:
     return results
 
 
-def find_linked_prs_from_timeline(timeline_events: list) -> list[int]:
-    """Extract PR numbers that were cross-referenced from timeline events."""
-    pr_numbers = set()
-    for event in timeline_events:
-        if not isinstance(event, dict):
-            continue
-
-        event_type = event.get("event")
-
-        if event_type == "cross-referenced":
-            source = event.get("source", {})
-            issue_data = source.get("issue", {})
-            pr_data = issue_data.get("pull_request", {})
-            if pr_data and issue_data.get("state") == "closed":
-                pr_url = pr_data.get("html_url", "") or issue_data.get("html_url", "")
-                if pr_url:
-                    try:
-                        pr_num = int(pr_url.rstrip("/").split("/")[-1])
-                        pr_numbers.add(pr_num)
-                    except (ValueError, IndexError):
-                        pass
-
-        elif event_type == "connected" or event_type == "closed":
-            commit_id = event.get("commit_id")
-            if event.get("source", {}).get("issue", {}).get("pull_request"):
-                source_issue = event["source"]["issue"]
-                try:
-                    pr_num = int(source_issue["html_url"].rstrip("/").split("/")[-1])
-                    pr_numbers.add(pr_num)
-                except (ValueError, IndexError, KeyError):
-                    pass
-
-    return sorted(pr_numbers)
-
-
-def find_linked_prs_from_events(events: list) -> list[int]:
-    """Extract PR numbers from issue events (closed via commit/PR)."""
-    pr_numbers = set()
-    for event in events:
-        if not isinstance(event, dict):
-            continue
-        if event.get("event") == "closed" and event.get("commit_id"):
-            pass
-        if event.get("event") == "referenced":
-            pass
-    return sorted(pr_numbers)
-
-
-def find_closing_pr_from_body(issue_body: str, pr_list: list[dict],
-                               owner: str, repo: str) -> Optional[int]:
-    """Look for PR references in issue body text (less reliable fallback)."""
-    if not issue_body:
-        return None
-    pr_ref_pattern = re.compile(
-        rf'(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*#(\d+)',
-        re.IGNORECASE
-    )
-    matches = pr_ref_pattern.findall(issue_body)
-    for match in matches:
-        pr_num = int(match)
-        for pr in pr_list:
-            if pr.get("number") == pr_num:
-                return pr_num
-    return None
