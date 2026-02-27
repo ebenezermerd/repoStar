@@ -20,7 +20,7 @@ from .models import (
 )
 from .scoring import score_complexity
 
-PULL_URL_NUMBER_PATTERN = re.compile(r"/pull/(\d+)")
+PULL_URL_NUMBER_PATTERN = re.compile(r"/pulls?/(\d+)")
 
 
 @dataclass(frozen=True)

@@ -18,9 +18,9 @@ class ScoringTest(unittest.TestCase):
 
         medium = score_complexity(
             python_non_test_files_changed=6,
-            total_python_changes=320,
+            total_python_changes=220,
             pr_commits=3,
-            max_single_python_file_changes=120,
+            max_single_python_file_changes=80,
             issue_body_length=260,
         )
         self.assertEqual(medium.label, "medium")
