@@ -101,23 +101,32 @@ class IssueAnalyzer:
         if early_reject and analysis.rejection_reasons:
             return analysis
 
-        pr_number = self._find_linked_pr(owner, repo, issue_number, issue_data)
-        if pr_number is None:
+        linked_prs = self._find_linked_prs(owner, repo, issue_number, issue_data)
+        analysis.linked_pr_count = len(linked_prs)
+
+        if len(linked_prs) == 0:
             analysis.rejection_reasons.append("No linked merged PR found")
             return analysis
 
-        analysis.pr_number = pr_number
-        self._analyze_pr(analysis, owner, repo, pr_number)
+        if len(linked_prs) > 1:
+            analysis.rejection_reasons.append(
+                f"Multiple merged PRs linked ({len(linked_prs)}): "
+                f"{', '.join(f'#{n}' for n in linked_prs)}. "
+                f"One-way link required (1 issue -> 1 PR)."
+            )
+
+        analysis.pr_number = linked_prs[0]
+        self._analyze_pr(analysis, owner, repo, linked_prs[0])
         self._compute_complexity(analysis)
 
         analysis.meets_criteria = len(analysis.rejection_reasons) == 0
         return analysis
 
-    def _find_linked_pr(self, owner: str, repo: str, issue_number: int,
-                        issue_data: dict) -> Optional[int]:
-        """Find the single merged PR from the same repo that closes this issue.
+    def _find_linked_prs(self, owner: str, repo: str, issue_number: int,
+                         issue_data: dict) -> list[int]:
+        """Find all merged PRs from the same repo linked to this issue.
 
-        Uses multiple strategies in order of reliability:
+        Returns a deduplicated list of PR numbers. Uses multiple strategies:
         1. Timeline cross-references filtered to same repo + closing commit match
         2. Same-repo PRs whose body contains closing keywords for this issue
         3. Same-repo merged PRs that are cross-referenced
@@ -198,17 +207,13 @@ class IssueAnalyzer:
                     if re.search(close_pattern, body, re.IGNORECASE):
                         merged_prs.append(item["number"])
 
-        if not merged_prs:
-            return None
-
         unique_prs = list(dict.fromkeys(merged_prs))
         if len(unique_prs) > 1:
             logger.info(
-                "Issue #%d has %d linked merged PRs from same repo: %s. Using first.",
+                "Issue #%d has %d linked merged PRs from same repo: %s",
                 issue_number, len(unique_prs), unique_prs
             )
-
-        return unique_prs[0]
+        return unique_prs
 
     def _analyze_pr(self, analysis: IssueAnalysis, owner: str, repo: str, pr_number: int):
         """Analyze the linked PR's file changes."""
