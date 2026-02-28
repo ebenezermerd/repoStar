@@ -21,6 +21,7 @@ from .github_client import GitHubClient, RepoInfo, IssueInfo
 from .issue_analyzer import IssueAnalyzer, _count_code_python_files, _body_has_links_or_images
 from .repo_analyzer import analyze_repo
 from .scraper import GitHubScraper
+from .history import HistoryStore
 
 console = Console()
 
@@ -34,6 +35,7 @@ class InteractiveSession:
         self.client = GitHubClient(token)
         self.analyzer = IssueAnalyzer(self.client)
         self.scraper = GitHubScraper(token)
+        self.history = HistoryStore()
 
         # State
         self.search_results: list[RepoInfo] = []
@@ -74,10 +76,16 @@ class InteractiveSession:
         return f"{base}> "
 
     def _print_banner(self):
+        blocked = len(self.history.list_by_status("blocked"))
+        worked = len(self.history.list_by_status("worked"))
+        extra = ""
+        if blocked or worked:
+            extra = f"\n[dim]History: {worked} worked, {blocked} blocked[/dim]"
         console.print(Panel(
             "[bold cyan]Issue Finder[/bold cyan] — Interactive Mode\n"
             "[dim]PR Writer HFI Project[/dim]\n\n"
-            "Type [bold]help[/bold] for available commands.",
+            "Type [bold]help[/bold] for available commands."
+            + extra,
             border_style="cyan",
             expand=False,
         ))
@@ -108,6 +116,14 @@ class InteractiveSession:
             "help":     self._cmd_help,
             "quit":     self._cmd_quit,
             "exit":     self._cmd_quit,
+            # Smart search presets
+            "light":    self._cmd_light,
+            "best":     self._cmd_best,
+            "label":    self._cmd_label,
+            # History commands
+            "mark":     self._cmd_mark,
+            "history":  self._cmd_history,
+            "unblock":  self._cmd_unblock,
         }
 
         handler = handlers.get(cmd)
@@ -123,13 +139,14 @@ class InteractiveSession:
                 f"[red]Unknown command:[/red] {cmd}. Type [bold]help[/bold] for commands."
             )
 
-    # ── Commands ────────────────────────────────────────────────
+    # ── Search commands ─────────────────────────────────────────
 
     def _cmd_search(self, query: str):
         """Search GitHub for Python repositories (uses web scraping)."""
         if not query:
             console.print("[yellow]Usage:[/yellow] search <keyword>")
             console.print("[dim]  Examples: search pyeve · search sqlfluff · search fastapi[/dim]")
+            console.print("[dim]  Presets:  light <keyword> · best <keyword> · label <name>[/dim]")
             return
 
         console.print(
@@ -177,6 +194,15 @@ class InteractiveSession:
                     console.print(f"[red]Search failed: {escape(str(e2))}[/red]")
                     return
 
+        # Filter out blocked repos
+        blocked = self.history.blocked_keys()
+        if blocked:
+            before = len(self.search_results)
+            self.search_results = [r for r in self.search_results if r.full_name not in blocked]
+            hidden = before - len(self.search_results)
+            if hidden:
+                console.print(f"[dim]  ({hidden} blocked repos hidden)[/dim]")
+
         if not self.search_results:
             console.print("[yellow]No repositories found.[/yellow]")
             return
@@ -184,35 +210,104 @@ class InteractiveSession:
         console.print("[dim]  (scraped via GitHub JSON endpoint)[/dim]")
         self._print_repos_table()
 
+    def _cmd_light(self, query: str):
+        """Search for lightweight repos (small, no heavy ML/CUDA deps)."""
+        if not query:
+            console.print("[yellow]Usage:[/yellow] light <keyword>")
+            console.print("[dim]  Finds repos < 50 MB with no heavy deps (pytorch, tensorflow, etc.)[/dim]")
+            return
+
+        console.print(f"[cyan]Searching for lightweight Python repos matching '{escape(query)}'…[/cyan]")
+        with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as prog:
+            task = prog.add_task("Filtering lightweight repos…", total=None)
+            self.search_results = self.scraper.search_light_repos(
+                query, min_stars=self.min_stars, max_results=self.max_repos,
+            )
+            prog.update(task, description=f"Found {len(self.search_results)} light repos.")
+
+        blocked = self.history.blocked_keys()
+        self.search_results = [r for r in self.search_results if r.full_name not in blocked]
+
+        if not self.search_results:
+            console.print("[yellow]No lightweight repos found.[/yellow]")
+            return
+
+        console.print("[dim]  (filtered: < 50 MB, no pytorch/tensorflow/cuda/spark deps)[/dim]")
+        self._print_repos_table()
+
+    def _cmd_best(self, query: str):
+        """Search for well-maintained, active repos with good issue tracking."""
+        if not query:
+            console.print("[yellow]Usage:[/yellow] best <keyword>")
+            console.print("[dim]  Finds active repos with 500+ stars, recent pushes, good-first-issues[/dim]")
+            return
+
+        console.print(f"[cyan]Searching for best Python repos matching '{escape(query)}'…[/cyan]")
+        with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as prog:
+            task = prog.add_task("Finding best repos…", total=None)
+            self.search_results = self.scraper.search_best_repos(
+                query, min_stars=max(self.min_stars, 500), max_results=self.max_repos,
+            )
+            prog.update(task, description=f"Found {len(self.search_results)} repos.")
+
+        blocked = self.history.blocked_keys()
+        self.search_results = [r for r in self.search_results if r.full_name not in blocked]
+
+        if not self.search_results:
+            console.print("[yellow]No matching repos found.[/yellow]")
+            return
+
+        console.print("[dim]  (filtered: 500+ stars, pushed recently, has good-first-issues)[/dim]")
+        self._print_repos_table()
+
+    def _cmd_label(self, args: str):
+        """List issues by label for selected repo."""
+        if not self._require_repo():
+            return
+        if not args:
+            console.print("[yellow]Usage:[/yellow] label <name>")
+            console.print("[dim]  Examples: label bug · label enhancement · label good-first-issue[/dim]")
+            return
+
+        console.print(f"[cyan]Scraping issues with label '{escape(args)}' from {self.selected_repo.full_name}…[/cyan]")
+        with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as prog:
+            task = prog.add_task("Scraping…", total=None)
+            self.issues_cache = self.scraper.search_by_label(
+                self.selected_repo.full_name, args, max_issues=self.max_issues,
+            )
+            prog.update(task, description=f"Found {len(self.issues_cache)} issues.")
+
+        if not self.issues_cache:
+            console.print(f"[yellow]No closed issues with label '{args}' found.[/yellow]")
+            return
+
+        self._display_issues_table()
+
+    # ── Remaining commands ──────────────────────────────────────
+
     def _cmd_repos(self, _args: str):
-        """Re-display search results."""
         if not self.search_results:
             console.print("[yellow]No search results. Use [bold]search <keyword>[/bold] first.[/yellow]")
             return
         self._print_repos_table()
 
     def _cmd_repo(self, name: str):
-        """Jump directly to a repo by owner/name."""
         if not name:
             console.print("[yellow]Usage:[/yellow] repo <owner/repo>")
-            console.print("[dim]  Example: repo sqlfluff/sqlfluff[/dim]")
             return
         if "/" not in name:
-            console.print("[yellow]Format: owner/repo (e.g. pyeve/eve)[/yellow]")
+            console.print("[yellow]Format: owner/repo[/yellow]")
             return
-
         console.print(f"[cyan]Fetching {escape(name)}…[/cyan]")
         info = self.client.get_repo_info(name)
         if not info:
             console.print(f"[red]Repository not found: {name}[/red]")
             return
-
         self.selected_repo = info
         self.issues_cache = []
         self._print_repo_panel(info)
 
     def _cmd_select(self, idx_str: str):
-        """Pick a repo from search results by row number."""
         if not self.search_results:
             console.print("[yellow]No search results. Use [bold]search <keyword>[/bold] first.[/yellow]")
             return
@@ -227,22 +322,18 @@ class InteractiveSession:
         if idx < 1 or idx > len(self.search_results):
             console.print(f"[red]Choose 1–{len(self.search_results)}.[/red]")
             return
-
         self.selected_repo = self.search_results[idx - 1]
         self.issues_cache = []
         self._print_repo_panel(self.selected_repo)
 
     def _cmd_info(self, _args: str):
-        """Show selected repo info."""
         if not self._require_repo():
             return
         self._print_repo_panel(self.selected_repo)
 
     def _cmd_analyze(self, args: str):
-        """Analyze repo (no args) or a specific issue (issue #)."""
         if not self._require_repo():
             return
-
         if args:
             try:
                 issue_num = int(args.lstrip("#"))
@@ -254,21 +345,17 @@ class InteractiveSession:
             self._analyze_repo()
 
     def _cmd_issues(self, args: str):
-        """List closed issues for selected repo."""
         if not self._require_repo():
             return
-
         limit = self.max_issues
         if args:
             try:
                 limit = int(args)
             except ValueError:
                 pass
-
         self._fetch_and_show_issues(limit)
 
     def _cmd_issue(self, args: str):
-        """Inspect a single issue by number."""
         if not self._require_repo():
             return
         if not args:
@@ -282,14 +369,12 @@ class InteractiveSession:
         self._show_issue_detail(num)
 
     def _cmd_results(self, _args: str):
-        """Display accumulated analysis results."""
         if not self.analysis_results:
             console.print("[yellow]No results yet. Use [bold]analyze <issue#>[/bold] to build the list.[/yellow]")
             return
         self._print_results_table()
 
     def _cmd_export(self, args: str):
-        """Export results to JSON or CSV."""
         if not self.analysis_results:
             console.print("[yellow]Nothing to export.[/yellow]")
             return
@@ -297,28 +382,23 @@ class InteractiveSession:
         if len(parts) < 2:
             console.print("[yellow]Usage:[/yellow] export json <file>  or  export csv <file>")
             return
-        fmt, path = parts[0].lower(), parts[1]
-        self._do_export(fmt, path)
+        self._do_export(parts[0].lower(), parts[1])
 
     def _cmd_exclude(self, path: str):
-        """Load an exclusion list."""
         if not path:
             n = len(self.excluded)
             console.print(f"[cyan]Currently excluding {n} issue(s).[/cyan]" if n else "[yellow]Usage:[/yellow] exclude <file>")
             return
-
         from .main import load_excluded_issues
         self.excluded = load_excluded_issues(path)
         console.print(f"[green]Loaded {len(self.excluded)} excluded issues from {path}[/green]")
 
     def _cmd_set(self, args: str):
-        """Change a setting value."""
         parts = args.split(maxsplit=1)
         if len(parts) < 2:
             console.print("[yellow]Usage:[/yellow] set <key> <value>")
             console.print("[dim]  Keys: min-stars, max-repos, max-issues, min-score[/dim]")
             return
-
         key = parts[0].lower().replace("_", "-")
         val = parts[1]
         try:
@@ -338,7 +418,6 @@ class InteractiveSession:
             console.print(f"[red]Invalid value: {val}[/red]")
 
     def _cmd_settings(self, _args: str):
-        """Show current settings."""
         tbl = Table(title="Settings", show_header=True)
         tbl.add_column("Key", style="cyan")
         tbl.add_column("Value", justify="right")
@@ -348,6 +427,9 @@ class InteractiveSession:
         tbl.add_row("min-score", str(self.min_score))
         tbl.add_row("excluded", str(len(self.excluded)))
         tbl.add_row("token", "[green]✓ set[/green]" if self.client.token else "[red]✗ not set[/red]")
+        tbl.add_row("history file", self.history.path)
+        tbl.add_row("blocked", str(len(self.history.list_by_status("blocked"))))
+        tbl.add_row("worked", str(len(self.history.list_by_status("worked"))))
         console.print(tbl)
 
     def _cmd_clear(self, _args: str):
@@ -363,28 +445,142 @@ class InteractiveSession:
         else:
             console.print("[dim]Nothing to go back from.[/dim]")
 
-    def _cmd_help(self, _args: str):
-        tbl = Table(
-            title="Commands", show_header=True, border_style="cyan", pad_edge=False,
+    # ── History commands ────────────────────────────────────────
+
+    def _cmd_mark(self, args: str):
+        """Mark an issue as worked / skipped / blocked."""
+        parts = args.split(maxsplit=1)
+        if not parts:
+            console.print("[yellow]Usage:[/yellow] mark worked | mark skip <reason> | mark block <reason>")
+            console.print("[dim]  Marks the last analyzed issue. Or: mark repo block <reason>[/dim]")
+            return
+
+        action = parts[0].lower()
+        reason = parts[1] if len(parts) > 1 else ""
+
+        # "mark repo block/skip <reason>" — marks the selected repo itself
+        if action == "repo":
+            if not self._require_repo():
+                return
+            sub_parts = reason.split(maxsplit=1)
+            if not sub_parts:
+                console.print("[yellow]Usage:[/yellow] mark repo block <reason>")
+                return
+            repo_action = sub_parts[0].lower()
+            repo_reason = sub_parts[1] if len(sub_parts) > 1 else ""
+            status_map = {"block": "blocked", "skip": "skipped", "worked": "worked"}
+            status = status_map.get(repo_action)
+            if not status:
+                console.print("[red]Use: block, skip, or worked[/red]")
+                return
+            self.history.mark_repo(self.selected_repo.full_name, status, repo_reason)
+            console.print(f"[green]Repo {self.selected_repo.full_name} marked as {status}.[/green]")
+            return
+
+        if not self.analysis_results:
+            console.print("[yellow]No analyzed issues yet. Analyze an issue first.[/yellow]")
+            return
+
+        last = self.analysis_results[-1]
+        status_map = {"worked": "worked", "work": "worked", "skip": "skipped", "block": "blocked"}
+        status = status_map.get(action)
+        if not status:
+            console.print("[red]Use: worked, skip, or block[/red]")
+            return
+
+        self.history.mark(
+            repo=last["repo"],
+            issue_number=last["issue_number"],
+            status=status,
+            reason=reason,
+            issue_title=last.get("issue_title", ""),
+            score=last.get("score", 0),
+            pr_number=last.get("pr_number", 0),
+            base_sha=last.get("base_sha", ""),
         )
+        console.print(
+            f"[green]#{last['issue_number']} in {last['repo']} → {status}"
+            + (f" ({reason})" if reason else "")
+            + "[/green]"
+        )
+
+    def _cmd_history(self, args: str):
+        """Show tracked history."""
+        filt = args.lower() if args else ""
+        entries = self.history.all_entries()
+        if filt:
+            entries = [e for e in entries if e.status == filt]
+
+        if not entries:
+            console.print("[yellow]History is empty.[/yellow]" if not filt else f"[yellow]No '{filt}' entries.[/yellow]")
+            console.print("[dim]Use [bold]mark worked|skip|block[/bold] after analyzing an issue.[/dim]")
+            return
+
+        tbl = Table(title=f"History ({len(entries)})", show_lines=True)
+        tbl.add_column("Key", style="cyan", max_width=30)
+        tbl.add_column("Status", justify="center")
+        tbl.add_column("Title", max_width=35)
+        tbl.add_column("Reason", max_width=30)
+        tbl.add_column("When", style="dim", max_width=12)
+
+        status_style = {"worked": "[green]worked[/green]", "skipped": "[yellow]skipped[/yellow]", "blocked": "[red]blocked[/red]"}
+        for e in entries[:30]:
+            tbl.add_row(
+                e.key,
+                status_style.get(e.status, e.status),
+                e.issue_title[:35] if e.issue_title else "",
+                e.reason[:30] if e.reason else "",
+                e.timestamp[:10] if e.timestamp else "",
+            )
+        console.print(tbl)
+        if len(entries) > 30:
+            console.print(f"[dim]  … and {len(entries) - 30} more. Use 'history worked|skipped|blocked' to filter.[/dim]")
+
+    def _cmd_unblock(self, args: str):
+        """Remove a blocked entry from history."""
+        if not args:
+            console.print("[yellow]Usage:[/yellow] unblock <key>")
+            console.print("[dim]  Example: unblock owner/repo#123 or unblock owner/repo[/dim]")
+            return
+        if self.history.get_entry(args):
+            self.history.remove(args)
+            console.print(f"[green]Removed {args} from history.[/green]")
+        else:
+            console.print(f"[yellow]{args} not found in history.[/yellow]")
+
+    # ── Help ────────────────────────────────────────────────────
+
+    def _cmd_help(self, _args: str):
+        tbl = Table(title="Commands", show_header=True, border_style="cyan", pad_edge=False)
         tbl.add_column("Command", style="bold cyan", min_width=28)
         tbl.add_column("Description")
 
         rows = [
-            ("search <keyword>",      "Search GitHub for Python repositories"),
+            ("search <keyword>",      "Search GitHub for Python repos"),
+            ("light <keyword>",       "Search lightweight repos (no heavy deps)"),
+            ("best <keyword>",        "Search well-maintained, active repos"),
             ("repos",                  "Re-display search results"),
-            ("select <n>",            "Select repo # from search results"),
+            ("select <n>",            "Select repo # from results"),
             ("repo <owner/repo>",     "Jump directly to a repository"),
-            ("info",                   "Show selected repo details + criteria check"),
-            ("analyze",                "Check selected repo against PR Writer criteria"),
+            ("info",                   "Show selected repo details"),
+            ("analyze",                "Check repo against PR Writer criteria"),
             ("analyze <issue#>",      "Full analysis of a specific issue"),
-            ("issues [limit]",        "List closed issues for selected repo"),
+            ("issues [limit]",        "List closed issues (scraped, no PRs)"),
+            ("label <name>",          "List issues by label (e.g. bug, enhancement)"),
             ("issue <number>",        "Inspect a single issue"),
-            ("results",                "Show all analyzed issues so far"),
+            ("results",                "Show all analyzed issues"),
             ("export json|csv <file>","Export results to file"),
-            ("exclude <file>",        "Load excluded-issues file"),
-            ("set <key> <value>",     "Change setting (min-stars, max-repos, max-issues, min-score)"),
+            ("─── History ───",        "─────────────────────────────────────"),
+            ("mark worked",           "Mark last analyzed issue as done"),
+            ("mark skip <reason>",    "Skip with reason (hidden next time)"),
+            ("mark block <reason>",   "Blacklist (auto-hidden in future)"),
+            ("mark repo block <why>", "Blacklist entire repo"),
+            ("history [status]",      "Show history (filter: worked/skipped/blocked)"),
+            ("unblock <key>",         "Remove from blocked list"),
+            ("─── Settings ───",       "─────────────────────────────────────"),
+            ("set <key> <value>",     "Change setting"),
             ("settings",               "Show current settings"),
+            ("exclude <file>",        "Load excluded-issues file"),
             ("clear",                  "Clear cached results"),
             ("back",                   "Deselect current repo"),
             ("help",                   "This message"),
@@ -412,29 +608,37 @@ class InteractiveSession:
     # ── Display helpers ─────────────────────────────────────────
 
     def _print_repos_table(self):
-        tbl = Table(
-            title=f"Search Results ({len(self.search_results)} repos)", show_lines=False,
-        )
-        tbl.add_column("#", justify="right", style="bold white")
+        tbl = Table(title=f"Search Results ({len(self.search_results)} repos)", show_lines=False)
+        tbl.add_column("Row", justify="right", style="bold white", width=4)
         tbl.add_column("Repository", style="cyan")
         tbl.add_column("Stars", justify="right")
         tbl.add_column("Size", justify="right")
         tbl.add_column("Description", max_width=50)
 
         for i, r in enumerate(self.search_results, 1):
+            status = self.history.is_tracked(r.full_name)
+            tag = ""
+            if status == "worked":
+                tag = " [green]✓[/green]"
+            elif status == "skipped":
+                tag = " [yellow]⊘[/yellow]"
             tbl.add_row(
                 str(i),
-                r.full_name,
+                r.full_name + tag,
                 f"{r.stars:,}",
-                f"{r.size_kb / 1024:.1f} MB",
+                f"{r.size_kb / 1024:.1f} MB" if r.size_kb else "—",
                 (r.description or "")[:50],
             )
         console.print(tbl)
-        console.print("[dim]Use [bold]select <#>[/bold] to pick a repo.[/dim]")
+        console.print("[dim]Use [bold]select <row>[/bold] to pick a repo.[/dim]")
 
     def _print_repo_panel(self, info: RepoInfo):
         result = analyze_repo(info)
         ok = result.passes
+        hist = self.history.is_tracked(info.full_name)
+        hist_line = ""
+        if hist:
+            hist_line = f"\n  History: [bold]{hist}[/bold]"
         console.print(Panel(
             f"[bold]{escape(info.full_name)}[/bold]\n"
             f"  Stars: [bold]{info.stars:,}[/bold]  ·  "
@@ -444,7 +648,8 @@ class InteractiveSession:
             f"  {escape(info.description or '')}\n\n"
             f"  PR Writer criteria: "
             + ("[green]✓ Passes[/green]" if ok else "[red]✗ Fails[/red]")
-            + f"  ({result.summary})",
+            + f"  ({result.summary})"
+            + hist_line,
             title=f"Selected: {info.full_name}",
             border_style="green" if ok else "red",
             expand=False,
@@ -455,12 +660,10 @@ class InteractiveSession:
         tbl = Table(title=f"Repo Analysis: {self.selected_repo.full_name}")
         tbl.add_column("Check", style="bold")
         tbl.add_column("Result")
-
         for reason in result.reasons:
             ok = "OK" in reason or "Python repo" in reason
             mark = "[green]✓[/green]" if ok else "[red]✗[/red]"
             tbl.add_row(mark, reason)
-
         tbl.add_row("", "")
         if result.passes:
             tbl.add_row("[bold]Overall[/bold]", f"[bold green]PASSES (score {result.score:.1f})[/bold green]")
@@ -470,33 +673,20 @@ class InteractiveSession:
 
     def _fetch_and_show_issues(self, limit: int):
         console.print(
-            f"[cyan]Scraping closed issues from {self.selected_repo.full_name} "
-            f"(limit {limit})…[/cyan]"
+            f"[cyan]Scraping closed issues from {self.selected_repo.full_name} (limit {limit})…[/cyan]"
         )
         self.issues_cache = []
-
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            console=console,
-        ) as prog:
+        with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as prog:
             task = prog.add_task("Scraping issue listing pages…", total=None)
             max_pages = max(1, limit // 25 + 1)
             try:
                 self.issues_cache = self.scraper.list_closed_issues(
-                    self.selected_repo.full_name,
-                    max_pages=max_pages,
-                    max_issues=limit,
+                    self.selected_repo.full_name, max_pages=max_pages, max_issues=limit,
                 )
-                prog.update(
-                    task,
-                    description=f"Scraped {len(self.issues_cache)} issues.",
-                )
+                prog.update(task, description=f"Scraped {len(self.issues_cache)} issues.")
             except Exception:
                 prog.update(task, description="Scraping failed, trying API…")
-                for issue in self.client.get_closed_issues(
-                    self.selected_repo.full_name, max_issues=limit,
-                ):
+                for issue in self.client.get_closed_issues(self.selected_repo.full_name, max_issues=limit):
                     self.issues_cache.append(issue)
                     prog.update(task, description=f"Found {len(self.issues_cache)} issues…")
 
@@ -507,38 +697,58 @@ class InteractiveSession:
             )
             return
 
-        console.print("[dim]  (scraped from HTML listing — real issues only, no PRs)[/dim]")
+        # Filter out blocked issues
+        blocked = self.history.blocked_keys()
+        if blocked:
+            before = len(self.issues_cache)
+            self.issues_cache = [
+                iss for iss in self.issues_cache
+                if f"{self.selected_repo.full_name}#{iss.number}" not in blocked
+            ]
+            hidden = before - len(self.issues_cache)
+            if hidden:
+                console.print(f"[dim]  ({hidden} blocked issues hidden)[/dim]")
 
-        tbl = Table(
-            title=f"Closed Issues ({len(self.issues_cache)})", show_lines=False,
-        )
-        tbl.add_column("#", justify="right", style="bold white")
-        tbl.add_column("Issue", style="green")
+        console.print("[dim]  (scraped from HTML — real issues only, no PRs)[/dim]")
+        self._display_issues_table()
+
+    def _display_issues_table(self):
+        """Render the issues table with correct issue numbers and labels."""
+        tbl = Table(title=f"Closed Issues ({len(self.issues_cache)})", show_lines=False)
+        tbl.add_column("Issue #", justify="right", style="green", width=8)
         tbl.add_column("Title", max_width=55)
-        tbl.add_column("Labels", max_width=30)
+        tbl.add_column("Labels", style="magenta", max_width=30)
+        tbl.add_column("Status", justify="center", width=8)
 
-        for i, iss in enumerate(self.issues_cache, 1):
+        repo = self.selected_repo.full_name if self.selected_repo else ""
+        for iss in self.issues_cache:
+            hist = self.history.is_tracked(repo, iss.number) if repo else ""
+            status_icon = ""
+            if hist == "worked":
+                status_icon = "[green]✓[/green]"
+            elif hist == "skipped":
+                status_icon = "[yellow]⊘[/yellow]"
+            elif hist == "blocked":
+                status_icon = "[red]✗[/red]"
+
+            label_str = ", ".join(iss.labels[:3]) if iss.labels else "[dim]—[/dim]"
+
             tbl.add_row(
-                str(i),
                 f"#{iss.number}",
                 iss.title[:55],
-                ", ".join(iss.labels[:3]) or "",
+                label_str,
+                status_icon,
             )
         console.print(tbl)
-        console.print(
-            "[dim]Use [bold]analyze <issue#>[/bold] to run full analysis "
-            "(use the GitHub issue number, not the row number).[/dim]"
-        )
+        console.print("[dim]Use [bold]analyze <issue#>[/bold] (GitHub issue number, not row).[/dim]")
 
     def _show_issue_detail(self, num: int):
         issue_info = self._resolve_issue(num)
         if not issue_info:
             return
-
         body_preview = (issue_info.body or "")[:300]
         if len(issue_info.body or "") > 300:
             body_preview += "…"
-
         console.print(Panel(
             f"[bold]#{issue_info.number}[/bold]: {escape(issue_info.title)}\n"
             f"  State: {issue_info.state}  ·  Author: {issue_info.user_login}  ·  "
@@ -550,9 +760,7 @@ class InteractiveSession:
             title="Issue Details",
             expand=False,
         ))
-        console.print(
-            "[dim]Use [bold]analyze " + str(num) + "[/bold] for full PR Writer analysis.[/dim]"
-        )
+        console.print(f"[dim]Use [bold]analyze {num}[/bold] for full PR Writer analysis.[/dim]")
 
     def _analyze_issue(self, num: int):
         issue_info = self._resolve_issue(num)
@@ -562,31 +770,26 @@ class InteractiveSession:
         key = f"{self.selected_repo.full_name}#{num}"
         if key in self.excluded:
             console.print(f"[yellow]⚠ Issue {key} is on the excluded list.[/yellow]")
+        hist = self.history.is_tracked(self.selected_repo.full_name, num)
+        if hist:
+            console.print(f"[dim]  History: previously marked as {hist}[/dim]")
 
-        console.print(f"[cyan]Analyzing #{num} (using scraper + Timeline API)…[/cyan]")
+        console.print(f"[cyan]Analyzing #{num} (scraper + Timeline API)…[/cyan]")
 
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            console=console,
-        ) as prog:
+        with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as prog:
             task = prog.add_task("Scraping linked PRs via Timeline API…", total=None)
-            analysis = self.analyzer.analyze_issue(
-                self.selected_repo.full_name, issue_info,
-            )
+            analysis = self.analyzer.analyze_issue(self.selected_repo.full_name, issue_info)
             prog.update(task, description="Done.")
 
         body_pure = not _body_has_links_or_images(issue_info.body)
         passes = analysis.passes
 
-        # Header
         console.print()
         console.print(f"[bold]#{issue_info.number}:[/bold] {issue_info.title}")
         console.print(f"  {issue_info.html_url}")
         console.print(
             f"  Body: {'[green]pure text ✓[/green]' if body_pure else '[red]has links/images ✗[/red]'}"
         )
-
         score_style = "green" if passes else ("yellow" if analysis.score > 0 else "red")
         console.print(
             f"  Score: [bold {score_style}]{analysis.score:.1f}[/bold {score_style}]  ·  "
@@ -598,8 +801,7 @@ class InteractiveSession:
         console.print()
         for reason in analysis.reasons:
             positive = any(
-                kw in reason.lower()
-                for kw in ("ok", "pure text", "substantive", "files changed")
+                kw in reason.lower() for kw in ("ok", "pure text", "substantive", "files changed")
             ) and "Only" not in reason and "No " not in reason
             mark = "[green]✓[/green]" if positive else "[red]✗[/red]"
             console.print(f"  {mark} {reason}")
@@ -612,18 +814,18 @@ class InteractiveSession:
             console.print(f"    Merged: {pr.merged}  ·  Closes: {pr.closes_issues}")
             console.print(f"    Files: {len(pr.files)} total, {code_files} Python code")
             if pr.base_sha:
-                console.print(f"    Base SHA: {pr.base_sha[:12]}…")
+                console.print(f"    Base SHA: [bold]{pr.base_sha}[/bold]")
             if pr.files:
                 console.print("    Files changed:")
                 for f in pr.files:
                     is_test = "test" in f.filename.lower()
                     name = escape(f.filename)
-                    line = f"      {name}: [green]+{f.additions}[/green]/[red]-{f.deletions}[/red]"
                     if is_test:
                         line = f"      [dim]{name}: +{f.additions}/-{f.deletions}[/dim]"
+                    else:
+                        line = f"      {name}: [green]+{f.additions}[/green]/[red]-{f.deletions}[/red]"
                     console.print(line)
 
-        # Store result
         base_sha = ""
         if analysis.pr_analysis and analysis.pr_analysis.base_sha:
             base_sha = analysis.pr_analysis.base_sha
@@ -650,15 +852,13 @@ class InteractiveSession:
         self.analysis_results.append(row)
         console.print(
             f"\n[dim]Result saved ({len(self.analysis_results)} total). "
-            f"Use [bold]results[/bold] to review.[/dim]"
+            f"Use [bold]results[/bold] to review, [bold]mark worked|skip|block[/bold] to track.[/dim]"
         )
 
     def _print_results_table(self):
         sorted_results = sorted(self.analysis_results, key=lambda r: -r["score"])
-        tbl = Table(
-            title=f"Analysis Results ({len(sorted_results)})", show_lines=True,
-        )
-        tbl.add_column("#", justify="right", style="bold")
+        tbl = Table(title=f"Analysis Results ({len(sorted_results)})", show_lines=True)
+        tbl.add_column("Row", justify="right", style="bold", width=4)
         tbl.add_column("Repo", style="cyan")
         tbl.add_column("Issue", style="green")
         tbl.add_column("Score", justify="right")
@@ -678,35 +878,24 @@ class InteractiveSession:
                 (r.get("complexity_hint") or "")[:22],
             )
         console.print(tbl)
-        console.print(
-            "[dim]Use [bold]export json <file>[/bold] or [bold]export csv <file>[/bold] to save.[/dim]"
-        )
+        console.print("[dim]Use [bold]export json|csv <file>[/bold] to save.[/dim]")
 
     # ── Issue resolution ────────────────────────────────────────
 
     def _resolve_issue(self, num: int) -> IssueInfo | None:
-        """Return an IssueInfo, from cache or by fetching it.
-
-        Tries scraper first, then falls back to API.
-        """
         cached = next((i for i in self.issues_cache if i.number == num), None)
         if cached and cached.body is not None:
             return cached
 
         console.print(f"[dim]Scraping issue #{num}…[/dim]")
-
-        # Try scraper first (gets body via HTML)
         try:
-            scraped = self.scraper.get_issue_detail(
-                self.selected_repo.full_name, num,
-            )
+            scraped = self.scraper.get_issue_detail(self.selected_repo.full_name, num)
             if scraped:
                 self.issues_cache.append(scraped)
                 return scraped
         except Exception:
             pass
 
-        # Fallback to PyGithub API
         console.print(f"[dim]Falling back to API for #{num}…[/dim]")
         try:
             repo = self.client.get_repo(self.selected_repo.full_name)
@@ -715,11 +904,8 @@ class InteractiveSession:
                 console.print(f"[yellow]#{num} is a pull request, not an issue.[/yellow]")
                 return None
             info = IssueInfo(
-                number=obj.number,
-                title=obj.title,
-                body=obj.body or "",
-                state=obj.state,
-                html_url=obj.html_url,
+                number=obj.number, title=obj.title, body=obj.body or "",
+                state=obj.state, html_url=obj.html_url,
                 created_at=obj.created_at.isoformat(),
                 closed_at=obj.closed_at.isoformat() if obj.closed_at else None,
                 user_login=obj.user.login if obj.user else "",
@@ -758,6 +944,5 @@ class InteractiveSession:
 # ─── Entry point ────────────────────────────────────────────────────────────
 
 def run_interactive(token: str | None = None) -> int:
-    """Launch the interactive session."""
     session = InteractiveSession(token)
     return session.run()
