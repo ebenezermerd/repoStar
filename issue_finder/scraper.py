@@ -269,17 +269,20 @@ class GitHubScraper:
         for _ in range(5):
             if search is None:
                 break
-            # Label links contain label%3A in href
             for a_lbl in search.find_all("a", href=re.compile(r"label%3A")):
-                # The actual name is inside a TokenTextContainer or similar span
+                href = a_lbl.get("href", "")
+                # Skip author links disguised as label links
+                if "author%3A" in href and "label%3A" not in href.split("author%3A")[0][-20:]:
+                    continue
+
+                # Best: get name from TokenTextContainer span
                 name_span = a_lbl.find("span", class_=re.compile(r"TokenText"))
                 if name_span:
                     name = name_span.get_text(strip=True)
                 else:
-                    # Extract from URL: label%3A<name>
-                    href = a_lbl.get("href", "")
-                    lm = re.search(r"label%3A([^&+\s]+)", href)
-                    name = lm.group(1) if lm else a_lbl.get_text(strip=True)
+                    # Extract label name from URL (stop at %20 or +)
+                    lm = re.search(r"label%3A([^&+%\s]+)", href)
+                    name = lm.group(1) if lm else ""
 
                 if name and name not in labels and len(name) < 40:
                     labels.append(name)
