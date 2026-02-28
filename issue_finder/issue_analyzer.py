@@ -9,6 +9,7 @@ from .config import (
     DOC_FILE_PATTERNS,
     MIN_PYTHON_FILES_CHANGED,
     MIN_SUBSTANTIAL_CHANGES_IN_FILE,
+    NOISE_TITLE_PATTERNS,
     TEST_FILE_PATTERNS,
     URL_PATTERN,
 )
@@ -64,6 +65,29 @@ def _has_substantial_changes(files: list[PRFileChange], min_changes: int = 5) ->
 def _count_code_python_files(files: list[PRFileChange]) -> int:
     """Count Python code files changed (excluding test and doc)."""
     return sum(1 for f in files if _is_code_python_file(f.filename))
+
+
+def pre_filter(issue: IssueInfo, profile=None) -> bool:
+    """Quick check using only issue metadata — no API calls needed.
+
+    Skips issues with noise titles, skip-labels, or non-closed state.
+    Saves expensive PR lookups by eliminating obvious non-candidates.
+    """
+    if issue.state != "closed":
+        return False
+
+    # Skip noise titles
+    title_lower = issue.title.lower()
+    if any(p in title_lower for p in NOISE_TITLE_PATTERNS):
+        return False
+
+    # Skip by label if profile provided
+    if profile is not None:
+        skip = {l.lower() for l in profile.skip_labels}
+        if any(l.lower() in skip for l in issue.labels):
+            return False
+
+    return True
 
 
 @dataclass

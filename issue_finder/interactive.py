@@ -2,8 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import json
+import os
+import signal
+import sys
+import termios
+import threading
+import tty
+from pathlib import Path
 
 try:
     import readline  # noqa: F401 — enables arrow keys / history in input()
@@ -18,20 +26,139 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from .config import GITHUB_SEARCH_EXCLUSIONS
 from .github_client import GitHubClient, RepoInfo, IssueInfo
-from .issue_analyzer import IssueAnalyzer, _count_code_python_files, _body_has_links_or_images
+from .issue_analyzer import IssueAnalyzer, _count_code_python_files, _body_has_links_or_images, pre_filter
 from .repo_analyzer import analyze_repo
 from .scraper import GitHubScraper
 from .history import HistoryStore
+from .profiles import load_profile, list_profiles, PR_WRITER_PROFILE, ScoringProfile
 
 console = Console()
 
 
+# ─── ESC key listener ────────────────────────────────────────────────────────
+
+class _EscListener:
+    """Context manager that listens for ESC key in a background thread.
+
+    While active, pressing ESC sends SIGINT to the current process,
+    which raises KeyboardInterrupt in the main thread — identical to Ctrl+C.
+    Terminal is put into raw mode so single key-presses are detected.
+    """
+
+    def __init__(self):
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._old_settings = None
+
+    def __enter__(self):
+        fd = sys.stdin.fileno()
+        if not os.isatty(fd):
+            return self
+        try:
+            self._old_settings = termios.tcgetattr(fd)
+            tty.setcbreak(fd)  # cbreak: single char reads, still allow signals
+        except termios.error:
+            self._old_settings = None
+            return self
+
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._listen, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        if self._old_settings is not None:
+            try:
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self._old_settings)
+            except termios.error:
+                pass
+        self._old_settings = None
+
+    def _listen(self):
+        fd = sys.stdin.fileno()
+        while not self._stop.is_set():
+            if self._stop.wait(0.05):
+                break
+            try:
+                # Check if data available (non-blocking)
+                import select as _sel
+                rlist, _, _ = _sel.select([fd], [], [], 0.1)
+                if rlist:
+                    ch = os.read(fd, 1)
+                    if ch == b'\x1b':  # ESC
+                        os.kill(os.getpid(), signal.SIGINT)
+                        break
+            except (OSError, ValueError):
+                break
+
+
+def _cancellable(fn):
+    """Decorator that wraps a command in the ESC listener.
+
+    While the command runs, pressing ESC or Ctrl+C cancels it.
+    """
+    def wrapper(self, args):
+        with _EscListener():
+            return fn(self, args)
+    wrapper.__name__ = fn.__name__
+    wrapper.__doc__ = fn.__doc__
+    return wrapper
+
+
 # ─── Session ────────────────────────────────────────────────────────────────
+
+_TOKEN_FILE = Path.home() / ".issue_finder" / "token"
+
+
+def _load_saved_token() -> str | None:
+    """Load persisted GitHub token from disk."""
+    try:
+        if _TOKEN_FILE.exists():
+            t = _TOKEN_FILE.read_text().strip()
+            return t if t else None
+    except OSError:
+        pass
+    return None
+
+
+def _save_token(token: str) -> None:
+    """Persist GitHub token to disk."""
+    _TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _TOKEN_FILE.write_text(token + "\n")
+    _TOKEN_FILE.chmod(0o600)
+
+
+def _delete_saved_token() -> bool:
+    """Remove persisted token. Returns True if a file was deleted."""
+    try:
+        if _TOKEN_FILE.exists():
+            _TOKEN_FILE.unlink()
+            return True
+    except OSError:
+        pass
+    return False
+
 
 class InteractiveSession:
     """Stateful interactive CLI session."""
 
     def __init__(self, token: str | None = None):
+        # Token priority: CLI arg > env var > saved file
+        if token:
+            self._token_source = "cli"
+        elif os.environ.get("GITHUB_TOKEN"):
+            token = os.environ["GITHUB_TOKEN"]
+            self._token_source = "env"
+        else:
+            saved = _load_saved_token()
+            if saved:
+                token = saved
+                self._token_source = "saved"
+            else:
+                self._token_source = "none"
+
+        self.token = token
         self.client = GitHubClient(token)
         self.analyzer = IssueAnalyzer(self.client)
         self.scraper = GitHubScraper(token)
@@ -49,6 +176,14 @@ class InteractiveSession:
         self.max_repos: int = 50
         self.max_issues: int = 100
         self.min_score: float = 5.0
+        self.concurrency: int = 10
+
+        # Profile
+        self.profile: ScoringProfile = PR_WRITER_PROFILE
+
+        # Async client (lazy init)
+        self._async_client = None
+        self._cache = None
 
     # ── Main loop ───────────────────────────────────────────────
 
@@ -81,11 +216,21 @@ class InteractiveSession:
         extra = ""
         if blocked or worked:
             extra = f"\n[dim]History: {worked} worked, {blocked} blocked[/dim]"
+
+        # Token status line
+        if self.token:
+            source_map = {"cli": "via --token", "env": "via GITHUB_TOKEN", "saved": "loaded from disk"}
+            src = source_map.get(self._token_source, "")
+            token_line = f"\n[green]Token: set ({src})[/green]"
+        else:
+            token_line = "\n[yellow]Token: not set — use [bold]set token <value>[/bold] to persist one[/yellow]"
+
         console.print(Panel(
             "[bold cyan]Issue Finder[/bold cyan] — Interactive Mode\n"
             "[dim]PR Writer HFI Project[/dim]\n\n"
-            "Type [bold]help[/bold] for available commands."
-            + extra,
+            "Type [bold]help[/bold] for available commands.\n"
+            "[dim]Press [bold]ESC[/bold] or [bold]Ctrl+C[/bold] to cancel any running operation.[/dim]"
+            + token_line + extra,
             border_style="cyan",
             expand=False,
         ))
@@ -110,8 +255,11 @@ class InteractiveSession:
             "export":   self._cmd_export,
             "exclude":  self._cmd_exclude,
             "set":      self._cmd_set,
+            "unset":    self._cmd_unset,
+            "update":   self._cmd_update,
             "settings": self._cmd_settings,
             "clear":    self._cmd_clear,
+            "clean":    self._cmd_clean,
             "back":     self._cmd_back,
             "help":     self._cmd_help,
             "quit":     self._cmd_quit,
@@ -124,6 +272,12 @@ class InteractiveSession:
             "mark":     self._cmd_mark,
             "history":  self._cmd_history,
             "unblock":  self._cmd_unblock,
+            # Async / discovery commands
+            "discover": self._cmd_discover,
+            "profile":  self._cmd_profile,
+            "scan":     self._cmd_scan,
+            "autoscan": self._cmd_autoscan,
+            "cache":    self._cmd_cache,
         }
 
         handler = handlers.get(cmd)
@@ -141,6 +295,7 @@ class InteractiveSession:
 
     # ── Search commands ─────────────────────────────────────────
 
+    @_cancellable
     def _cmd_search(self, query: str):
         """Search GitHub for Python repositories (uses web scraping)."""
         if not query:
@@ -210,6 +365,7 @@ class InteractiveSession:
         console.print("[dim]  (scraped via GitHub JSON endpoint)[/dim]")
         self._print_repos_table()
 
+    @_cancellable
     def _cmd_light(self, query: str):
         """Search for lightweight repos (small, no heavy ML/CUDA deps)."""
         if not query:
@@ -235,6 +391,7 @@ class InteractiveSession:
         console.print("[dim]  (filtered: < 50 MB, no pytorch/tensorflow/cuda/spark deps)[/dim]")
         self._print_repos_table()
 
+    @_cancellable
     def _cmd_best(self, query: str):
         """Search for well-maintained, active repos with good issue tracking."""
         if not query:
@@ -260,6 +417,7 @@ class InteractiveSession:
         console.print("[dim]  (filtered: 500+ stars, pushed recently, has good-first-issues)[/dim]")
         self._print_repos_table()
 
+    @_cancellable
     def _cmd_label(self, args: str):
         """List issues by label for selected repo."""
         if not self._require_repo():
@@ -291,6 +449,7 @@ class InteractiveSession:
             return
         self._print_repos_table()
 
+    @_cancellable
     def _cmd_repo(self, name: str):
         if not name:
             console.print("[yellow]Usage:[/yellow] repo <owner/repo>")
@@ -331,6 +490,7 @@ class InteractiveSession:
             return
         self._print_repo_panel(self.selected_repo)
 
+    @_cancellable
     def _cmd_analyze(self, args: str):
         if not self._require_repo():
             return
@@ -344,6 +504,7 @@ class InteractiveSession:
         else:
             self._analyze_repo()
 
+    @_cancellable
     def _cmd_issues(self, args: str):
         if not self._require_repo():
             return
@@ -355,6 +516,7 @@ class InteractiveSession:
                 pass
         self._fetch_and_show_issues(limit)
 
+    @_cancellable
     def _cmd_issue(self, args: str):
         if not self._require_repo():
             return
@@ -397,12 +559,24 @@ class InteractiveSession:
         parts = args.split(maxsplit=1)
         if len(parts) < 2:
             console.print("[yellow]Usage:[/yellow] set <key> <value>")
-            console.print("[dim]  Keys: min-stars, max-repos, max-issues, min-score[/dim]")
+            console.print("[dim]  Keys: token, min-stars, max-repos, max-issues, min-score, concurrency[/dim]")
             return
         key = parts[0].lower().replace("_", "-")
         val = parts[1]
         try:
-            if key == "min-stars":
+            if key == "token":
+                self._apply_token(val)
+                _save_token(val)
+                self._token_source = "saved"
+                console.print("[green]token → ✓ set and saved[/green]")
+                console.print(f"[dim]  Stored in {_TOKEN_FILE}[/dim]")
+                return
+            elif key == "concurrency":
+                self.concurrency = int(val)
+                self._async_client = None
+                console.print(f"[green]concurrency → {val}[/green]")
+                return
+            elif key == "min-stars":
                 self.min_stars = int(val)
             elif key == "max-repos":
                 self.max_repos = int(val)
@@ -417,6 +591,46 @@ class InteractiveSession:
         except ValueError:
             console.print(f"[red]Invalid value: {val}[/red]")
 
+    def _apply_token(self, token: str | None):
+        """Apply a token to all clients (session-level)."""
+        self.token = token
+        self.client = GitHubClient(token)
+        self.analyzer = IssueAnalyzer(self.client)
+        self.scraper = GitHubScraper(token)
+        self._async_client = None  # reset lazy async client
+
+    def _cmd_unset(self, args: str):
+        key = args.strip().lower().replace("_", "-")
+        if not key:
+            console.print("[yellow]Usage:[/yellow] unset token")
+            return
+        if key == "token":
+            self._apply_token(None)
+            deleted = _delete_saved_token()
+            self._token_source = "none"
+            if deleted:
+                console.print("[green]Token removed from session and deleted from disk.[/green]")
+            else:
+                console.print("[green]Token removed from session.[/green] [dim](no saved token on disk)[/dim]")
+        else:
+            console.print(f"[red]Cannot unset: {key}[/red] [dim](only 'token' is supported)[/dim]")
+
+    def _cmd_update(self, args: str):
+        parts = args.split(maxsplit=1)
+        if len(parts) < 2:
+            console.print("[yellow]Usage:[/yellow] update token <new_value>")
+            return
+        key = parts[0].lower().replace("_", "-")
+        if key == "token":
+            val = parts[1]
+            self._apply_token(val)
+            _save_token(val)
+            self._token_source = "saved"
+            console.print("[green]Token updated and saved.[/green]")
+        else:
+            console.print(f"[dim]Tip: use [bold]set {key} <value>[/bold] instead.[/dim]")
+            self._cmd_set(args)
+
     def _cmd_settings(self, _args: str):
         tbl = Table(title="Settings", show_header=True)
         tbl.add_column("Key", style="cyan")
@@ -426,7 +640,18 @@ class InteractiveSession:
         tbl.add_row("max-issues", str(self.max_issues))
         tbl.add_row("min-score", str(self.min_score))
         tbl.add_row("excluded", str(len(self.excluded)))
-        tbl.add_row("token", "[green]✓ set[/green]" if self.client.token else "[red]✗ not set[/red]")
+
+        # Token with source info
+        if self.token:
+            masked = self.token[:4] + "…" + self.token[-4:]
+            source_map = {"cli": "via --token", "env": "via GITHUB_TOKEN", "saved": f"from {_TOKEN_FILE}"}
+            src = source_map.get(self._token_source, "")
+            tbl.add_row("token", f"[green]✓ {masked}[/green] [dim]({src})[/dim]")
+        else:
+            tbl.add_row("token", "[red]✗ not set[/red]")
+
+        tbl.add_row("profile", f"{self.profile.name} — {self.profile.description}")
+        tbl.add_row("concurrency", str(self.concurrency))
         tbl.add_row("history file", self.history.path)
         tbl.add_row("blocked", str(len(self.history.list_by_status("blocked"))))
         tbl.add_row("worked", str(len(self.history.list_by_status("worked"))))
@@ -436,6 +661,9 @@ class InteractiveSession:
         self.analysis_results = []
         self.issues_cache = []
         console.print("[green]Results and issue cache cleared.[/green]")
+
+    def _cmd_clean(self, _args: str):
+        os.system("clear" if os.name != "nt" else "cls")
 
     def _cmd_back(self, _args: str):
         if self.selected_repo:
@@ -548,6 +776,277 @@ class InteractiveSession:
         else:
             console.print(f"[yellow]{args} not found in history.[/yellow]")
 
+    # ── Async / Discovery commands ─────────────────────────────
+
+    def _get_async_client(self):
+        """Lazy-init async client with cache."""
+        if self._async_client is None:
+            from .async_client import AsyncGitHubClient
+            from .cache import CacheStore
+            self._cache = CacheStore(enabled=True)
+            self._async_client = AsyncGitHubClient(
+                token=self.token,
+                cache=self._cache,
+                concurrency=self.concurrency,
+            )
+        return self._async_client
+
+    def _run_async(self, coro):
+        """Run an async coroutine from sync context."""
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as pool:
+                    return pool.submit(asyncio.run, coro).result()
+            return loop.run_until_complete(coro)
+        except RuntimeError:
+            return asyncio.run(coro)
+
+    @_cancellable
+    def _cmd_discover(self, args: str):
+        """Auto-discover repos from trending + topics + curated sources."""
+        from .discovery import DiscoveryEngine
+
+        if not self.token:
+            console.print(
+                "[yellow]Warning: No token set. Discovery uses many API calls and will be slow/rate-limited.[/yellow]\n"
+                "[dim]  Set one with: set token <your_github_token>[/dim]"
+            )
+
+        sources = ("trending", "topics", "curated")
+        if args:
+            arg = args.lower().strip()
+            valid = {"trending", "topics", "curated"}
+            if arg in valid:
+                sources = (arg,)
+            else:
+                console.print(f"[yellow]Unknown source: {arg}. Options: trending, topics, curated[/yellow]")
+                return
+
+        client = self._get_async_client()
+        engine = DiscoveryEngine(client, self.profile)
+
+        console.print(f"[cyan]Discovering repos from: {', '.join(sources)}…[/cyan]")
+
+        with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as prog:
+            task = prog.add_task("Discovering…", total=None)
+            repos = self._run_async(engine.discover(max_repos=self.max_repos, sources=sources))
+            prog.update(task, description=f"Found {len(repos)} repos.")
+
+        # Filter out blocked repos
+        blocked = self.history.blocked_keys()
+        if blocked:
+            repos = [r for r in repos if r.full_name not in blocked]
+
+        self.search_results = repos
+
+        if not repos:
+            console.print("[yellow]No repos discovered. Try a different source or relax profile criteria.[/yellow]")
+            return
+
+        console.print(f"[green]Discovered {len(repos)} repos[/green] [dim](profile: {self.profile.name})[/dim]")
+        self._print_repos_table()
+
+    def _cmd_profile(self, args: str):
+        """Switch scoring profile or list available profiles."""
+        if not args or args.lower() == "list":
+            profiles = list_profiles()
+            tbl = Table(title="Scoring Profiles", show_header=True)
+            tbl.add_column("Name", style="cyan")
+            tbl.add_column("Description")
+            tbl.add_column("Min Stars", justify="right")
+            tbl.add_column("Min Files", justify="right")
+            tbl.add_column("Min Score", justify="right")
+            tbl.add_column("Active", justify="center")
+            for p in profiles:
+                active = "[green]✓[/green]" if p.name == self.profile.name else ""
+                tbl.add_row(
+                    p.name, p.description,
+                    str(p.min_stars), str(p.min_code_files_changed),
+                    str(p.min_score), active,
+                )
+            console.print(tbl)
+            console.print("[dim]Use [bold]profile <name>[/bold] to switch.[/dim]")
+            return
+
+        try:
+            self.profile = load_profile(args)
+            self.min_stars = self.profile.min_stars
+            self.min_score = self.profile.min_score
+            self._async_client = None  # reset to pick up new profile
+            console.print(f"[green]Switched to profile: {self.profile.name}[/green]")
+            console.print(f"[dim]  {self.profile.description}[/dim]")
+            console.print(f"[dim]  min_stars={self.profile.min_stars}, min_files={self.profile.min_code_files_changed}, min_score={self.profile.min_score}[/dim]")
+        except ValueError as e:
+            console.print(f"[red]{e}[/red]")
+
+    @_cancellable
+    def _cmd_scan(self, args: str):
+        """Scan current repo: list issues → pre-filter → analyze top candidates (async)."""
+        if not self._require_repo():
+            return
+
+        limit = self.max_issues
+        if args:
+            try:
+                limit = int(args)
+            except ValueError:
+                pass
+
+        client = self._get_async_client()
+        repo = self.selected_repo.full_name
+
+        console.print(f"[cyan]Scanning {repo} (limit {limit}, profile: {self.profile.name})…[/cyan]")
+
+        with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as prog:
+            task = prog.add_task("Scanning issues…", total=None)
+            results = self._run_async(
+                client.scan_repo(repo, self.profile, max_issues=limit, pre_filter=pre_filter)
+            )
+            prog.update(task, description=f"Found {len(results)} passing issues.")
+
+        if not results:
+            console.print("[yellow]No passing issues found in this repo.[/yellow]")
+            return
+
+        # Add to analysis_results
+        for r in results:
+            base_sha = ""
+            if r.pr_analysis and r.pr_analysis.base_sha:
+                base_sha = r.pr_analysis.base_sha
+            row = {
+                "repo": repo,
+                "repo_url": self.selected_repo.html_url,
+                "stars": self.selected_repo.stars,
+                "size_mb": round(self.selected_repo.size_kb / 1024, 2),
+                "issue_number": r.issue.number,
+                "issue_url": r.issue.html_url,
+                "issue_title": r.issue.title,
+                "pr_url": r.pr_analysis.html_url if r.pr_analysis else "",
+                "pr_number": r.pr_analysis.number if r.pr_analysis else 0,
+                "score": round(r.score, 2),
+                "code_files_changed": r.details.get("code_python_files_changed", 0),
+                "total_additions": r.details.get("total_additions", 0),
+                "total_deletions": r.details.get("total_deletions", 0),
+                "complexity_hint": r.complexity_hint,
+                "reasons": r.reasons,
+                "base_sha": base_sha,
+                "passes": r.passes,
+            }
+            self.analysis_results.append(row)
+
+        console.print(f"[green]Scan complete: {len(results)} issues pass criteria[/green]")
+        self._print_results_table()
+
+    @_cancellable
+    def _cmd_autoscan(self, _args: str):
+        """Full pipeline: discover repos → scan each → show best results."""
+        from .discovery import DiscoveryEngine
+
+        if not self.token:
+            console.print(
+                "[yellow]Warning: No token set. Autoscan makes hundreds of API calls and will be very slow.[/yellow]\n"
+                "[dim]  Set one with: set token <your_github_token>[/dim]"
+            )
+
+        client = self._get_async_client()
+        engine = DiscoveryEngine(client, self.profile)
+
+        console.print(f"[bold cyan]AutoScan[/bold cyan] — full pipeline (profile: {self.profile.name})")
+        console.print("[cyan]Step 1/3: Discovering repos…[/cyan]")
+
+        repos = self._run_async(engine.discover(max_repos=self.max_repos))
+
+        blocked = self.history.blocked_keys()
+        repos = [r for r in repos if r.full_name not in blocked]
+
+        if not repos:
+            console.print("[yellow]No repos discovered.[/yellow]")
+            return
+
+        console.print(f"[green]Found {len(repos)} repos[/green]")
+        console.print(f"[cyan]Step 2/3: Scanning {len(repos)} repos in parallel…[/cyan]")
+
+        scanned = [0]
+
+        def on_done(repo, results):
+            scanned[0] += 1
+            hits = f"[green]{len(results)} hits[/green]" if results else "[dim]0[/dim]"
+            console.print(f"  [{scanned[0]}/{len(repos)}] {repo.full_name} — {hits}")
+
+        all_results = self._run_async(
+            client.scan_repos_parallel(
+                repos, self.profile,
+                max_issues_per_repo=self.max_issues,
+                pre_filter=pre_filter,
+                on_repo_done=on_done,
+            )
+        )
+
+        console.print(f"\n[cyan]Step 3/3: Results[/cyan]")
+
+        if not all_results:
+            console.print("[yellow]No passing issues found across all repos.[/yellow]")
+            return
+
+        # Add to analysis results
+        for r in all_results:
+            repo_name = r.issue.html_url.split("/issues/")[0].split("github.com/")[-1]
+            base_sha = ""
+            if r.pr_analysis and r.pr_analysis.base_sha:
+                base_sha = r.pr_analysis.base_sha
+            row = {
+                "repo": repo_name,
+                "repo_url": f"https://github.com/{repo_name}",
+                "stars": 0,
+                "size_mb": 0,
+                "issue_number": r.issue.number,
+                "issue_url": r.issue.html_url,
+                "issue_title": r.issue.title,
+                "pr_url": r.pr_analysis.html_url if r.pr_analysis else "",
+                "pr_number": r.pr_analysis.number if r.pr_analysis else 0,
+                "score": round(r.score, 2),
+                "code_files_changed": r.details.get("code_python_files_changed", 0),
+                "total_additions": r.details.get("total_additions", 0),
+                "total_deletions": r.details.get("total_deletions", 0),
+                "complexity_hint": r.complexity_hint,
+                "reasons": r.reasons,
+                "base_sha": base_sha,
+                "passes": r.passes,
+            }
+            self.analysis_results.append(row)
+
+        console.print(f"\n[bold green]AutoScan complete: {len(all_results)} issues found across {len(repos)} repos[/bold green]")
+
+        if self._cache:
+            stats = self._cache.stats()
+            console.print(f"[dim]Cache: {stats['hits']} hits, {stats['misses']} misses ({stats['hit_rate']})[/dim]")
+
+        self._print_results_table()
+
+    def _cmd_cache(self, args: str):
+        """Cache management: clear, stats."""
+        if not self._cache:
+            from .cache import CacheStore
+            self._cache = CacheStore(enabled=True)
+
+        action = args.lower().strip() if args else "stats"
+
+        if action == "clear":
+            self._cache.invalidate()
+            console.print("[green]Cache cleared.[/green]")
+        elif action == "stats":
+            stats = self._cache.stats()
+            tbl = Table(title="Cache Statistics")
+            tbl.add_column("Key", style="cyan")
+            tbl.add_column("Value", justify="right")
+            for k, v in stats.items():
+                tbl.add_row(k, str(v))
+            console.print(tbl)
+        else:
+            console.print("[yellow]Usage: cache [clear|stats][/yellow]")
+
     # ── Help ────────────────────────────────────────────────────
 
     def _cmd_help(self, _args: str):
@@ -577,11 +1076,24 @@ class InteractiveSession:
             ("mark repo block <why>", "Blacklist entire repo"),
             ("history [status]",      "Show history (filter: worked/skipped/blocked)"),
             ("unblock <key>",         "Remove from blocked list"),
+            ("─── Discovery (async) ─", "─────────────────────────────────────"),
+            ("discover",               "Auto-discover repos (trending+topics+curated)"),
+            ("discover trending",     "Only trending Python repos"),
+            ("discover topics",       "Only topic-based search"),
+            ("discover curated",      "Only curated repo list"),
+            ("scan [limit]",          "Scan current repo (async, parallel analysis)"),
+            ("autoscan",              "Full pipeline: discover → scan → show best"),
+            ("profile [name]",        "Switch scoring profile (or list all)"),
+            ("cache [clear|stats]",   "Cache management"),
             ("─── Settings ───",       "─────────────────────────────────────"),
-            ("set <key> <value>",     "Change setting"),
+            ("set token <value>",     "Set and persist GitHub token to disk"),
+            ("update token <value>",  "Update persisted token (same as set)"),
+            ("unset token",           "Remove token from session and disk"),
+            ("set <key> <value>",     "Change setting (concurrency, min-stars, etc.)"),
             ("settings",               "Show current settings"),
             ("exclude <file>",        "Load excluded-issues file"),
             ("clear",                  "Clear cached results"),
+            ("clean",                  "Clear the terminal screen"),
             ("back",                   "Deselect current repo"),
             ("help",                   "This message"),
             ("quit / exit",           "Leave interactive mode"),
@@ -591,6 +1103,9 @@ class InteractiveSession:
         console.print(tbl)
 
     def _cmd_quit(self, _args: str):
+        # Clean up async client session
+        if self._async_client:
+            self._run_async(self._async_client.close())
         console.print("[dim]Goodbye![/dim]")
         raise SystemExit(0)
 
@@ -709,38 +1224,169 @@ class InteractiveSession:
             if hidden:
                 console.print(f"[dim]  ({hidden} blocked issues hidden)[/dim]")
 
+        # Quick-enrich: fetch linked PRs + body in parallel for all issues
+        self._quick_enrich_issues()
+
         console.print("[dim]  (scraped from HTML — real issues only, no PRs)[/dim]")
         self._display_issues_table()
 
+    def _quick_enrich_issues(self):
+        """Parallel fetch of linked PRs and body text for listed issues.
+
+        Populates self._issue_metrics with per-issue quick metrics:
+        {number: {has_pr, pr_count, body_pure, body_len, pre_filter_pass}}
+        """
+        self._issue_metrics: dict[int, dict] = {}
+        repo = self.selected_repo.full_name
+
+        async def _enrich_all():
+            client = self._get_async_client()
+            tasks = []
+            for iss in self.issues_cache:
+                tasks.append(self._enrich_one(client, repo, iss))
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        async def _dummy():
+            pass
+
+        try:
+            console.print("[dim]  Enriching issues (linked PRs, body check)…[/dim]")
+            self._run_async(_enrich_all())
+        except (KeyboardInterrupt, Exception):
+            pass  # best-effort enrichment
+
+    async def _enrich_one(self, client, repo: str, iss: IssueInfo):
+        """Enrich a single issue with quick metrics."""
+        metrics: dict = {
+            "has_pr": None,
+            "pr_count": 0,
+            "py_files": None,
+            "body_pure": None,
+            "body_len": 0,
+            "pre_filter": True,
+        }
+
+        try:
+            # Fetch linked PRs (cached, 1 API call via timeline)
+            pr_nums = await client.get_linked_prs(repo, iss.number)
+            metrics["pr_count"] = len(pr_nums)
+            metrics["has_pr"] = len(pr_nums) > 0
+
+            # Fetch first PR detail to get Python code file count
+            if pr_nums:
+                pr = await client.get_pr_detail(repo, pr_nums[0])
+                if pr and pr.files:
+                    metrics["py_files"] = _count_code_python_files(pr.files)
+
+            # Fetch body if missing
+            if iss.body is None:
+                detail = await client.get_issue_detail(repo, iss.number)
+                if detail:
+                    iss.body = detail.body
+                    iss.user_login = detail.user_login or iss.user_login
+                    iss.comments_count = detail.comments_count or iss.comments_count
+                    if not iss.labels and detail.labels:
+                        iss.labels = detail.labels
+
+            metrics["body_len"] = len(iss.body or "")
+            metrics["body_pure"] = not _body_has_links_or_images(iss.body)
+
+            # Quick pre-filter check
+            metrics["pre_filter"] = pre_filter(iss, self.profile)
+        except Exception:
+            pass
+
+        self._issue_metrics[iss.number] = metrics
+
     def _display_issues_table(self):
-        """Render the issues table with correct issue numbers and labels."""
-        tbl = Table(title=f"Closed Issues ({len(self.issues_cache)})", show_lines=False)
-        tbl.add_column("Issue #", justify="right", style="green", width=8)
-        tbl.add_column("Title", max_width=55)
-        tbl.add_column("Labels", style="magenta", max_width=30)
-        tbl.add_column("Status", justify="center", width=8)
+        """Render enriched issues table with metrics columns."""
+        tbl = Table(
+            title=f"Closed Issues — {self.selected_repo.full_name} ({len(self.issues_cache)})",
+            show_lines=False,
+        )
+        min_files = self.profile.min_code_files_changed
+        tbl.add_column("#", justify="right", style="green", width=6)
+        tbl.add_column("Title", max_width=40)
+        tbl.add_column("Labels", style="magenta", max_width=20)
+        tbl.add_column("Author", style="dim", max_width=14)
+        tbl.add_column("Comments", justify="right", width=8)
+        tbl.add_column("PR?", justify="center", width=5)
+        tbl.add_column(f"Py({min_files}+)", justify="center", width=7)
+        tbl.add_column("Body", justify="center", width=6)
+        tbl.add_column("Filter", justify="center", width=6)
+        tbl.add_column("Hist", justify="center", width=5)
 
         repo = self.selected_repo.full_name if self.selected_repo else ""
+        metrics = getattr(self, "_issue_metrics", {})
+
         for iss in self.issues_cache:
             hist = self.history.is_tracked(repo, iss.number) if repo else ""
-            status_icon = ""
+            hist_icon = ""
             if hist == "worked":
-                status_icon = "[green]✓[/green]"
+                hist_icon = "[green]✓[/green]"
             elif hist == "skipped":
-                status_icon = "[yellow]⊘[/yellow]"
+                hist_icon = "[yellow]⊘[/yellow]"
             elif hist == "blocked":
-                status_icon = "[red]✗[/red]"
+                hist_icon = "[red]✗[/red]"
 
-            label_str = ", ".join(iss.labels[:3]) if iss.labels else "[dim]—[/dim]"
+            label_str = ", ".join(iss.labels[:2]) if iss.labels else "[dim]—[/dim]"
+            author = iss.user_login[:14] if iss.user_login else "[dim]—[/dim]"
+            comments = str(iss.comments_count) if iss.comments_count else "[dim]0[/dim]"
+
+            # Metrics from enrichment
+            m = metrics.get(iss.number, {})
+            if m.get("has_pr") is True:
+                pr_icon = f"[green]✓{m['pr_count']}[/green]"
+            elif m.get("has_pr") is False:
+                pr_icon = "[red]✗[/red]"
+            else:
+                pr_icon = "[dim]?[/dim]"
+
+            py = m.get("py_files")
+            if py is not None:
+                py_icon = f"[green]{py}[/green]" if py >= min_files else f"[red]{py}[/red]"
+            else:
+                py_icon = "[dim]?[/dim]"
+
+            if m.get("body_pure") is True:
+                body_icon = "[green]✓[/green]"
+            elif m.get("body_pure") is False:
+                body_icon = "[red]✗[/red]"
+            else:
+                body_icon = "[dim]?[/dim]"
+
+            if m.get("pre_filter") is True:
+                filter_icon = "[green]✓[/green]"
+            elif m.get("pre_filter") is False:
+                filter_icon = "[dim]skip[/dim]"
+            else:
+                filter_icon = "[dim]?[/dim]"
 
             tbl.add_row(
                 f"#{iss.number}",
-                iss.title[:55],
+                iss.title[:40],
                 label_str,
-                status_icon,
+                author,
+                comments,
+                pr_icon,
+                py_icon,
+                body_icon,
+                filter_icon,
+                hist_icon,
             )
+
         console.print(tbl)
-        console.print("[dim]Use [bold]analyze <issue#>[/bold] (GitHub issue number, not row).[/dim]")
+        console.print()
+
+        # Legend
+        console.print(
+            f"[dim]Columns: PR? = has linked PR · Py({min_files}+) = Python code files changed "
+            f"([green]green[/green] >= {min_files}) · Body = pure text · Filter = pre-filter[/dim]"
+        )
+        console.print(
+            "[dim]Use [bold]analyze <issue#>[/bold] for full analysis. "
+            "Issues with [green]✓[/green] in PR? and Body columns are best candidates.[/dim]"
+        )
 
     def _show_issue_detail(self, num: int):
         issue_info = self._resolve_issue(num)
@@ -763,41 +1409,258 @@ class InteractiveSession:
         console.print(f"[dim]Use [bold]analyze {num}[/bold] for full PR Writer analysis.[/dim]")
 
     def _analyze_issue(self, num: int):
+        from .issue_analyzer import (
+            IssueAnalysisResult, _is_code_python_file, _is_test_file,
+            _is_doc_file, _has_substantial_changes,
+        )
+
         issue_info = self._resolve_issue(num)
         if not issue_info:
             return
 
-        key = f"{self.selected_repo.full_name}#{num}"
+        repo = self.selected_repo.full_name
+        key = f"{repo}#{num}"
         if key in self.excluded:
             console.print(f"[yellow]⚠ Issue {key} is on the excluded list.[/yellow]")
-        hist = self.history.is_tracked(self.selected_repo.full_name, num)
+        hist = self.history.is_tracked(repo, num)
         if hist:
             console.print(f"[dim]  History: previously marked as {hist}[/dim]")
 
         console.print(f"[cyan]Analyzing #{num} (scraper + Timeline API)…[/cyan]")
 
+        # Use the scraper directly (same path as table enrichment) for consistency
         with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as prog:
-            task = prog.add_task("Scraping linked PRs via Timeline API…", total=None)
-            analysis = self.analyzer.analyze_issue(self.selected_repo.full_name, issue_info)
+            task = prog.add_task("Finding linked PRs via Timeline API…", total=None)
+            pr_nums = self.scraper.get_linked_prs(repo, num)
+            prog.update(task, description=f"Found {len(pr_nums)} linked PR(s).")
+
+            best_pr = None
+            if pr_nums:
+                prog.update(task, description=f"Fetching PR details ({len(pr_nums)} PRs)…")
+                # Try to find one-way close PR first
+                for pr_num in pr_nums:
+                    pr = self.scraper.get_pr_detail(repo, pr_num)
+                    if pr and num in pr.closes_issues and len(pr.closes_issues) == 1:
+                        best_pr = pr
+                        break
+                # Fallback: any PR that closes this issue
+                if not best_pr:
+                    for pr_num in pr_nums:
+                        pr = self.scraper.get_pr_detail(repo, pr_num)
+                        if pr and num in pr.closes_issues:
+                            best_pr = pr
+                            break
+                # Fallback: first linked PR
+                if not best_pr and pr_nums:
+                    best_pr = self.scraper.get_pr_detail(repo, pr_nums[0])
             prog.update(task, description="Done.")
+
+        # Build analysis result with scoring
+        reasons = []
+        details = {}
+        score = 0.0
+
+        # Body check
+        body_pure = not _body_has_links_or_images(issue_info.body)
+        if body_pure:
+            score += self.profile.pure_body_score
+            reasons.append("Body is pure text")
+        else:
+            reasons.append("Issue body contains links or images (must be pure text)")
+
+        # PR + files scoring
+        code_files = 0
+        subst = False
+        if best_pr and best_pr.files:
+            code_files = _count_code_python_files(best_pr.files)
+            subst = _has_substantial_changes(best_pr.files, self.profile.min_substantial_changes)
+        details["code_python_files_changed"] = code_files
+
+        if not best_pr:
+            reasons.append("No PR found that references this issue")
+        elif not (num in best_pr.closes_issues and len(best_pr.closes_issues) == 1):
+            reasons.append(f"No PR with one-way close (closes only this issue)")
+
+        if code_files >= self.profile.min_code_files_changed:
+            score += self.profile.code_files_score
+            reasons.append(f"{code_files} Python code files changed")
+        else:
+            reasons.append(f"Only {code_files} Python code files changed (need >= {self.profile.min_code_files_changed})")
+
+        if subst:
+            score += self.profile.substantial_changes_score
+            reasons.append("At least one code file has substantial changes")
+        else:
+            reasons.append(f"No code file has >= {self.profile.min_substantial_changes} lines changed")
+
+        if len(issue_info.title) >= 10:
+            score += self.profile.good_title_score
+        else:
+            reasons.append("Issue title may be too vague")
+
+        if issue_info.body and len(issue_info.body) > 50:
+            score += self.profile.good_description_score
+            reasons.append("Issue has substantive description")
+        else:
+            reasons.append("Issue description may be too brief")
+
+        total_adds = sum(f.additions for f in best_pr.files) if best_pr else 0
+        total_dels = sum(f.deletions for f in best_pr.files) if best_pr else 0
+        details["total_additions"] = total_adds
+        details["total_deletions"] = total_dels
+        total_chg = total_adds + total_dels
+        if total_chg > 100:
+            complexity_hint = "High complexity"
+        elif total_chg > 50:
+            complexity_hint = "Medium-high complexity"
+        elif total_chg > 20:
+            complexity_hint = "Medium complexity"
+        else:
+            complexity_hint = "May be too simple"
+
+        passes = (
+            code_files >= self.profile.min_code_files_changed
+            and subst
+            and best_pr is not None
+        )
+
+        analysis = IssueAnalysisResult(
+            issue=issue_info,
+            pr_analysis=best_pr,
+            passes=passes,
+            reasons=reasons,
+            details=details,
+            score=score,
+            complexity_hint=complexity_hint,
+        )
 
         body_pure = not _body_has_links_or_images(issue_info.body)
         passes = analysis.passes
-
-        console.print()
-        console.print(f"[bold]#{issue_info.number}:[/bold] {issue_info.title}")
-        console.print(f"  {issue_info.html_url}")
-        console.print(
-            f"  Body: {'[green]pure text ✓[/green]' if body_pure else '[red]has links/images ✗[/red]'}"
-        )
         score_style = "green" if passes else ("yellow" if analysis.score > 0 else "red")
-        console.print(
-            f"  Score: [bold {score_style}]{analysis.score:.1f}[/bold {score_style}]  ·  "
-            + ("[bold green]PASSES[/bold green]" if passes else "[bold red]DOES NOT PASS[/bold red]")
-        )
-        if analysis.complexity_hint:
-            console.print(f"  Complexity: {analysis.complexity_hint}")
+        verdict = "[bold green]PASSES[/bold green]" if passes else "[bold red]DOES NOT PASS[/bold red]"
 
+        # ── 1. Issue Header Panel ────────────────────────────────
+        issue_body = (issue_info.body or "").strip()
+
+        header_text = (
+            f"[bold]#{issue_info.number}[/bold]: {escape(issue_info.title)}\n"
+            f"\n"
+            f"  URL:      {issue_info.html_url}\n"
+            f"  State:    {issue_info.state}  ·  Author: {issue_info.user_login or '—'}\n"
+            f"  Labels:   {', '.join(issue_info.labels) or 'none'}\n"
+            f"  Comments: {issue_info.comments_count}\n"
+            f"  Created:  {issue_info.created_at or '—'}  ·  Closed: {issue_info.closed_at or '—'}"
+        )
+        console.print(Panel(header_text, title="Issue", border_style="cyan", expand=False))
+
+        # Full issue description in its own panel so links are clearly visible
+        if issue_body:
+            console.print(Panel(
+                escape(issue_body),
+                title="Issue Description",
+                border_style="cyan" if body_pure else "red",
+                subtitle="[red]contains links/images[/red]" if not body_pure else None,
+                expand=False,
+            ))
+        else:
+            console.print("[dim]  (no issue description)[/dim]")
+
+        # ── 2. Scoring Breakdown Table ───────────────────────────
+        score_tbl = Table(title="Scoring Breakdown", show_header=True, border_style="blue", expand=False)
+        score_tbl.add_column("Gate / Criterion", style="bold", min_width=30)
+        score_tbl.add_column("Status", justify="center", width=8)
+        score_tbl.add_column("Points", justify="right", width=8)
+        score_tbl.add_column("Detail", max_width=40)
+
+        # Gate 1: closed
+        score_tbl.add_row(
+            "Issue is closed",
+            "[green]✓[/green]" if issue_info.state == "closed" else "[red]✗[/red]",
+            "[dim]gate[/dim]",
+            issue_info.state,
+        )
+
+        # Gate 2: pure body
+        score_tbl.add_row(
+            "Body is pure text (no links/images)",
+            "[green]✓[/green]" if body_pure else "[red]✗[/red]",
+            f"+{self.profile.pure_body_score}" if body_pure else "0",
+            f"{len(issue_info.body or '')} chars" + ("" if body_pure else " — contains URLs"),
+        )
+
+        # Gate 3: linked PR
+        has_pr = analysis.pr_analysis is not None
+        score_tbl.add_row(
+            "Has linked PR",
+            "[green]✓[/green]" if has_pr else "[red]✗[/red]",
+            "[dim]gate[/dim]",
+            f"PR #{analysis.pr_analysis.number}" if has_pr else "none found",
+        )
+
+        # Gate 4: one-way closure
+        if has_pr:
+            one_way = len(analysis.pr_analysis.closes_issues) == 1
+            score_tbl.add_row(
+                "PR closes only this issue",
+                "[green]✓[/green]" if one_way else "[red]✗[/red]",
+                "[dim]gate[/dim]",
+                f"closes {analysis.pr_analysis.closes_issues}",
+            )
+
+        # Score: code files
+        code_files = analysis.details.get("code_python_files_changed", 0)
+        min_files = self.profile.min_code_files_changed
+        files_pass = code_files >= min_files
+        score_tbl.add_row(
+            f"Python code files changed (>= {min_files})",
+            "[green]✓[/green]" if files_pass else "[red]✗[/red]",
+            f"+{self.profile.code_files_score}" if files_pass else "0",
+            f"{code_files} files",
+        )
+
+        # Score: substantial changes
+        score_tbl.add_row(
+            f"Substantial changes (>= {self.profile.min_substantial_changes} lines)",
+            "[green]✓[/green]" if subst else "[red]✗[/red]",
+            f"+{self.profile.substantial_changes_score}" if subst else "0",
+            "",
+        )
+
+        # Score: title quality
+        good_title = len(issue_info.title) >= 10
+        score_tbl.add_row(
+            "Title >= 10 chars",
+            "[green]✓[/green]" if good_title else "[red]✗[/red]",
+            f"+{self.profile.good_title_score}" if good_title else "0",
+            f"{len(issue_info.title)} chars",
+        )
+
+        # Score: body quality
+        good_body = issue_info.body and len(issue_info.body) > 50
+        score_tbl.add_row(
+            "Description > 50 chars",
+            "[green]✓[/green]" if good_body else "[red]✗[/red]",
+            f"+{self.profile.good_description_score}" if good_body else "0",
+            f"{len(issue_info.body or '')} chars",
+        )
+
+        # Total row
+        max_score = (
+            self.profile.pure_body_score + self.profile.code_files_score
+            + self.profile.substantial_changes_score + self.profile.good_title_score
+            + self.profile.good_description_score
+        )
+        score_tbl.add_row("", "", "", "")
+        score_tbl.add_row(
+            f"[bold]Total Score[/bold] (min {self.profile.min_score})",
+            verdict,
+            f"[bold {score_style}]{analysis.score:.1f}[/bold {score_style}] / {max_score:.1f}",
+            analysis.complexity_hint,
+        )
+
+        console.print(score_tbl)
+
+        # ── 3. Criteria Checklist ────────────────────────────────
         console.print()
         for reason in analysis.reasons:
             positive = any(
@@ -806,26 +1669,79 @@ class InteractiveSession:
             mark = "[green]✓[/green]" if positive else "[red]✗[/red]"
             console.print(f"  {mark} {reason}")
 
+        # ── 4. PR Detail Panel ───────────────────────────────────
         if analysis.pr_analysis:
             pr = analysis.pr_analysis
-            code_files = _count_code_python_files(pr.files)
-            console.print()
-            console.print(f"  [cyan]Linked PR #{pr.number}[/cyan]  {pr.html_url}")
-            console.print(f"    Merged: {pr.merged}  ·  Closes: {pr.closes_issues}")
-            console.print(f"    Files: {len(pr.files)} total, {code_files} Python code")
-            if pr.base_sha:
-                console.print(f"    Base SHA: [bold]{pr.base_sha}[/bold]")
-            if pr.files:
-                console.print("    Files changed:")
-                for f in pr.files:
-                    is_test = "test" in f.filename.lower()
-                    name = escape(f.filename)
-                    if is_test:
-                        line = f"      [dim]{name}: +{f.additions}/-{f.deletions}[/dim]"
-                    else:
-                        line = f"      {name}: [green]+{f.additions}[/green]/[red]-{f.deletions}[/red]"
-                    console.print(line)
+            code_files_count = _count_code_python_files(pr.files)
+            test_files = [f for f in pr.files if _is_test_file(f.filename)]
+            doc_files = [f for f in pr.files if _is_doc_file(f.filename)]
+            code_file_list = [f for f in pr.files if _is_code_python_file(f.filename)]
+            other_files = [f for f in pr.files if f not in code_file_list and f not in test_files and f not in doc_files]
 
+            total_adds = sum(f.additions for f in pr.files)
+            total_dels = sum(f.deletions for f in pr.files)
+            code_adds = sum(f.additions for f in code_file_list)
+            code_dels = sum(f.deletions for f in code_file_list)
+
+            pr_header = (
+                f"[bold cyan]PR #{pr.number}[/bold cyan]\n"
+                f"\n"
+                f"  URL:     {pr.html_url}\n"
+                f"  State:   {pr.state}  ·  Merged: {'[green]yes[/green]' if pr.merged else '[red]no[/red]'}\n"
+                f"  Closes:  {pr.closes_issues}\n"
+                f"  Base SHA: [bold]{pr.base_sha or '—'}[/bold]\n"
+                f"\n"
+                f"  [bold]Change Summary:[/bold]\n"
+                f"    Total files:  {len(pr.files)} ({code_files_count} code, {len(test_files)} test, {len(doc_files)} doc, {len(other_files)} other)\n"
+                f"    Total lines:  [green]+{total_adds}[/green] / [red]-{total_dels}[/red] ({total_adds + total_dels} total)\n"
+                f"    Code lines:   [green]+{code_adds}[/green] / [red]-{code_dels}[/red]"
+            )
+            console.print(Panel(pr_header, title="Linked Pull Request", border_style="green" if pr.merged else "yellow", expand=False))
+
+            # PR description
+            pr_body = (pr.body or "").strip()
+            if pr_body:
+                console.print(Panel(
+                    escape(pr_body),
+                    title="PR Description",
+                    border_style="green" if pr.merged else "yellow",
+                    expand=False,
+                ))
+            else:
+                console.print("[dim]  (no PR description)[/dim]")
+
+            # Files table
+            if pr.files:
+                ftbl = Table(title="Files Changed", show_header=True, border_style="dim", expand=False)
+                ftbl.add_column("File", max_width=55)
+                ftbl.add_column("Type", justify="center", width=6)
+                ftbl.add_column("+", justify="right", style="green", width=6)
+                ftbl.add_column("-", justify="right", style="red", width=6)
+                ftbl.add_column("Total", justify="right", width=6)
+
+                for f in pr.files:
+                    if _is_code_python_file(f.filename):
+                        ftype = "[bold green]code[/bold green]"
+                    elif _is_test_file(f.filename):
+                        ftype = "[dim]test[/dim]"
+                    elif _is_doc_file(f.filename):
+                        ftype = "[dim]doc[/dim]"
+                    elif f.filename.endswith(".py"):
+                        ftype = "[yellow]py[/yellow]"
+                    else:
+                        ftype = "[dim]other[/dim]"
+
+                    ftbl.add_row(
+                        escape(f.filename),
+                        ftype,
+                        str(f.additions),
+                        str(f.deletions),
+                        str(f.additions + f.deletions),
+                    )
+
+                console.print(ftbl)
+
+        # ── 5. Save result ───────────────────────────────────────
         base_sha = ""
         if analysis.pr_analysis and analysis.pr_analysis.base_sha:
             base_sha = analysis.pr_analysis.base_sha

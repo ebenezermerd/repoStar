@@ -245,16 +245,54 @@ class GitHubScraper:
 
             labels = self._extract_labels_near(row)
 
+            # Extract comment count from the row
+            comments = 0
+            comment_link = row.find("a", href=re.compile(rf"/issues/{num}#"))
+            if comment_link:
+                ct = comment_link.get_text(strip=True).replace(",", "")
+                try:
+                    comments = int(ct)
+                except ValueError:
+                    pass
+            if not comments:
+                # Fallback: aria-label with comment count
+                for el in row.find_all(attrs={"aria-label": re.compile(r"\d+ comment")}):
+                    cm = re.search(r"(\d+)\s+comment", el.get("aria-label", ""))
+                    if cm:
+                        comments = int(cm.group(1))
+                        break
+
+            # Extract author
+            user = ""
+            for a_tag in row.find_all("a", href=True):
+                href = a_tag.get("href", "")
+                # Author links are /<username> with no extra path segments
+                if href.startswith("/") and href.count("/") == 1 and not href.startswith("//"):
+                    candidate = href.strip("/")
+                    # Skip org/repo links or known non-user paths
+                    if candidate and "/" not in candidate and candidate not in ("issues", "pulls", "labels"):
+                        text = a_tag.get_text(strip=True)
+                        if text and len(text) < 40 and not text.startswith("#"):
+                            user = candidate
+                            break
+
+            # Extract relative time
+            created = ""
+            closed = None
+            time_el = row.find("relative-time") or row.find("time-ago")
+            if time_el:
+                created = time_el.get("datetime", "")
+
             issues.append(IssueInfo(
                 number=num,
                 title=title,
                 body=None,
                 state="closed",
                 html_url=f"{GITHUB}/{repo}/issues/{num}",
-                created_at="",
-                closed_at=None,
-                user_login="",
-                comments_count=0,
+                created_at=created,
+                closed_at=closed,
+                user_login=user,
+                comments_count=comments,
                 labels=labels,
             ))
 
