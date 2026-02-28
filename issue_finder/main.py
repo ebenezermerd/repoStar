@@ -230,8 +230,18 @@ def main() -> int:
         default=None,
         help="Analyze single repository (owner/repo) instead of searching",
     )
+    parser.add_argument(
+        "-i", "--interactive",
+        action="store_true",
+        default=False,
+        help="Launch interactive mode (browse repos, pick issues, analyze live)",
+    )
 
     args = parser.parse_args()
+
+    if args.interactive:
+        from .interactive import run_interactive
+        return run_interactive(token=args.token)
 
     if args.repo:
         # Single repo mode
