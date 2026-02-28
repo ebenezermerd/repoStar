@@ -20,6 +20,7 @@ from .config import GITHUB_SEARCH_EXCLUSIONS
 from .github_client import GitHubClient, RepoInfo, IssueInfo
 from .issue_analyzer import IssueAnalyzer, _count_code_python_files, _body_has_links_or_images
 from .repo_analyzer import analyze_repo
+from .scraper import GitHubScraper
 
 console = Console()
 
@@ -32,6 +33,7 @@ class InteractiveSession:
     def __init__(self, token: str | None = None):
         self.client = GitHubClient(token)
         self.analyzer = IssueAnalyzer(self.client)
+        self.scraper = GitHubScraper(token)
 
         # State
         self.search_results: list[RepoInfo] = []
@@ -124,58 +126,62 @@ class InteractiveSession:
     # ── Commands ────────────────────────────────────────────────
 
     def _cmd_search(self, query: str):
-        """Search GitHub for Python repositories."""
+        """Search GitHub for Python repositories (uses web scraping)."""
         if not query:
             console.print("[yellow]Usage:[/yellow] search <keyword>")
             console.print("[dim]  Examples: search pyeve · search sqlfluff · search fastapi[/dim]")
             return
 
-        console.print(f"[cyan]Searching GitHub for Python repos matching '{escape(query)}'…[/cyan]")
+        console.print(
+            f"[cyan]Scraping GitHub search for Python repos matching "
+            f"'{escape(query)}' (stars ≥ {self.min_stars})…[/cyan]"
+        )
         self.search_results = []
 
-        exclude_clause = " ".join(f"NOT {w}" for w in GITHUB_SEARCH_EXCLUSIONS)
-        search_q = f"{query} language:Python stars:>={self.min_stars} {exclude_clause}"
-
-        try:
-            repos_iter = self.client.gh.search_repositories(
-                query=search_q, sort="stars", order="desc",
-            )
-            with Progress(
-                SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
-                console=console,
-            ) as prog:
-                task = prog.add_task("Fetching…", total=None)
-                for repo in repos_iter:
-                    if len(self.search_results) >= self.max_repos:
-                        break
-                    try:
-                        info = RepoInfo(
-                            full_name=repo.full_name,
-                            stars=repo.stargazers_count,
-                            size_kb=repo.size,
-                            language=repo.language or "",
-                            default_branch=repo.default_branch,
-                            html_url=repo.html_url,
-                            description=repo.description,
-                            pushed_at=(
-                                repo.pushed_at.isoformat() if repo.pushed_at else None
-                            ),
-                        )
-                        self.search_results.append(info)
-                        prog.update(
-                            task,
-                            description=f"Found {len(self.search_results)} repos…",
-                        )
-                    except Exception:
-                        continue
-        except Exception as e:
-            console.print(f"[red]Search failed: {e}[/red]")
-            return
+        with Progress(
+            SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+            console=console,
+        ) as prog:
+            task = prog.add_task("Scraping search results…", total=None)
+            try:
+                self.search_results = self.scraper.search_repos(
+                    query, language="Python",
+                    min_stars=self.min_stars, max_results=self.max_repos,
+                )
+                prog.update(task, description=f"Found {len(self.search_results)} repos.")
+            except Exception:
+                prog.update(task, description="Scraping failed, trying API…")
+                try:
+                    exclude_clause = " ".join(f"NOT {w}" for w in GITHUB_SEARCH_EXCLUSIONS)
+                    search_q = f"{query} language:Python stars:>={self.min_stars} {exclude_clause}"
+                    for repo in self.client.gh.search_repositories(
+                        query=search_q, sort="stars", order="desc",
+                    ):
+                        if len(self.search_results) >= self.max_repos:
+                            break
+                        try:
+                            self.search_results.append(RepoInfo(
+                                full_name=repo.full_name,
+                                stars=repo.stargazers_count,
+                                size_kb=repo.size,
+                                language=repo.language or "",
+                                default_branch=repo.default_branch,
+                                html_url=repo.html_url,
+                                description=repo.description,
+                                pushed_at=repo.pushed_at.isoformat() if repo.pushed_at else None,
+                            ))
+                            prog.update(task, description=f"Found {len(self.search_results)} repos…")
+                        except Exception:
+                            continue
+                except Exception as e2:
+                    console.print(f"[red]Search failed: {escape(str(e2))}[/red]")
+                    return
 
         if not self.search_results:
             console.print("[yellow]No repositories found.[/yellow]")
             return
 
+        console.print("[dim]  (scraped via GitHub JSON endpoint)[/dim]")
         self._print_repos_table()
 
     def _cmd_repos(self, _args: str):
@@ -464,7 +470,7 @@ class InteractiveSession:
 
     def _fetch_and_show_issues(self, limit: int):
         console.print(
-            f"[cyan]Scanning closed issues in {self.selected_repo.full_name} "
+            f"[cyan]Scraping closed issues from {self.selected_repo.full_name} "
             f"(limit {limit})…[/cyan]"
         )
         self.issues_cache = []
@@ -474,20 +480,34 @@ class InteractiveSession:
             TextColumn("[progress.description]{task.description}"),
             console=console,
         ) as prog:
-            task = prog.add_task("Scanning…", total=None)
-            for issue in self.client.get_closed_issues(
-                self.selected_repo.full_name, max_issues=limit,
-            ):
-                self.issues_cache.append(issue)
-                prog.update(task, description=f"Found {len(self.issues_cache)} issues…")
+            task = prog.add_task("Scraping issue listing pages…", total=None)
+            max_pages = max(1, limit // 25 + 1)
+            try:
+                self.issues_cache = self.scraper.list_closed_issues(
+                    self.selected_repo.full_name,
+                    max_pages=max_pages,
+                    max_issues=limit,
+                )
+                prog.update(
+                    task,
+                    description=f"Scraped {len(self.issues_cache)} issues.",
+                )
+            except Exception:
+                prog.update(task, description="Scraping failed, trying API…")
+                for issue in self.client.get_closed_issues(
+                    self.selected_repo.full_name, max_issues=limit,
+                ):
+                    self.issues_cache.append(issue)
+                    prog.update(task, description=f"Found {len(self.issues_cache)} issues…")
 
         if not self.issues_cache:
             console.print(
-                "[yellow]No issues found via the list API. This can happen when\n"
-                "recent closures are dominated by pull requests.[/yellow]\n"
+                "[yellow]No closed issues found.[/yellow]\n"
                 "[dim]Tip: use [bold]issue <number>[/bold] to look up a specific issue directly.[/dim]"
             )
             return
+
+        console.print("[dim]  (scraped from HTML listing — real issues only, no PRs)[/dim]")
 
         tbl = Table(
             title=f"Closed Issues ({len(self.issues_cache)})", show_lines=False,
@@ -495,15 +515,13 @@ class InteractiveSession:
         tbl.add_column("#", justify="right", style="bold white")
         tbl.add_column("Issue", style="green")
         tbl.add_column("Title", max_width=55)
-        tbl.add_column("Comments", justify="right")
-        tbl.add_column("Labels", max_width=25)
+        tbl.add_column("Labels", max_width=30)
 
         for i, iss in enumerate(self.issues_cache, 1):
             tbl.add_row(
                 str(i),
                 f"#{iss.number}",
                 iss.title[:55],
-                str(iss.comments_count),
                 ", ".join(iss.labels[:3]) or "",
             )
         console.print(tbl)
@@ -545,14 +563,14 @@ class InteractiveSession:
         if key in self.excluded:
             console.print(f"[yellow]⚠ Issue {key} is on the excluded list.[/yellow]")
 
-        console.print(f"[cyan]Analyzing #{num}…[/cyan]")
+        console.print(f"[cyan]Analyzing #{num} (using scraper + Timeline API)…[/cyan]")
 
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
             console=console,
         ) as prog:
-            task = prog.add_task("Finding linked PRs…", total=None)
+            task = prog.add_task("Scraping linked PRs via Timeline API…", total=None)
             analysis = self.analyzer.analyze_issue(
                 self.selected_repo.full_name, issue_info,
             )
@@ -667,12 +685,29 @@ class InteractiveSession:
     # ── Issue resolution ────────────────────────────────────────
 
     def _resolve_issue(self, num: int) -> IssueInfo | None:
-        """Return an IssueInfo, from cache or by fetching it."""
+        """Return an IssueInfo, from cache or by fetching it.
+
+        Tries scraper first, then falls back to API.
+        """
         cached = next((i for i in self.issues_cache if i.number == num), None)
-        if cached:
+        if cached and cached.body is not None:
             return cached
 
-        console.print(f"[dim]Fetching issue #{num}…[/dim]")
+        console.print(f"[dim]Scraping issue #{num}…[/dim]")
+
+        # Try scraper first (gets body via HTML)
+        try:
+            scraped = self.scraper.get_issue_detail(
+                self.selected_repo.full_name, num,
+            )
+            if scraped:
+                self.issues_cache.append(scraped)
+                return scraped
+        except Exception:
+            pass
+
+        # Fallback to PyGithub API
+        console.print(f"[dim]Falling back to API for #{num}…[/dim]")
         try:
             repo = self.client.get_repo(self.selected_repo.full_name)
             obj = repo.get_issue(num)
@@ -694,7 +729,7 @@ class InteractiveSession:
             self.issues_cache.append(info)
             return info
         except Exception as e:
-            console.print(f"[red]Could not fetch issue #{num}: {e}[/red]")
+            console.print(f"[red]Could not fetch issue #{num}: {escape(str(e))}[/red]")
             return None
 
     # ── Export ──────────────────────────────────────────────────

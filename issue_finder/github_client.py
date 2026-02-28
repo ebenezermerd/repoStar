@@ -158,7 +158,29 @@ class GitHubClient:
     def get_prs_linked_to_issue(
         self, full_name: str, issue_number: int
     ) -> list:
-        """Get PRs that reference/close an issue."""
+        """Get PRs that reference/close an issue.
+
+        Tries the scraper (Timeline API) first — one call instead of hundreds.
+        Falls back to the legacy full-scan approach.
+        """
+        # Fast path: scraper uses Timeline API + HTML fallback
+        try:
+            from .scraper import GitHubScraper
+            scraper = GitHubScraper(self.token)
+            pr_nums = scraper.get_linked_prs(full_name, issue_number)
+            if pr_nums:
+                repo = self.gh.get_repo(full_name)
+                prs = []
+                for num in pr_nums:
+                    try:
+                        prs.append(repo.get_pull(num))
+                    except Exception:
+                        continue
+                return prs
+        except Exception:
+            pass
+
+        # Legacy fallback: iterate all closed PRs
         try:
             repo = self.gh.get_repo(full_name)
             prs = []
