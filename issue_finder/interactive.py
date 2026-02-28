@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import getpass
+import hashlib
 import json
 import os
+import secrets
 import signal
 import sys
 import termios
@@ -140,6 +143,84 @@ def _delete_saved_token() -> bool:
     return False
 
 
+# ─── Admin password management ───────────────────────────────────────────────
+
+_PASSWORD_FILE = Path.home() / ".issue_finder" / "admin_password"
+
+
+def _hash_password(password: str, salt: str | None = None) -> tuple[str, str]:
+    """Hash a password with a salt using SHA-256. Returns (hash_hex, salt)."""
+    if salt is None:
+        salt = secrets.token_hex(16)
+    combined = f"{salt}:{password}".encode()
+    hashed = hashlib.sha256(combined).hexdigest()
+    return hashed, salt
+
+
+def _load_saved_password() -> dict | None:
+    """Load persisted admin password hash from disk. Returns {hash, salt} or None."""
+    try:
+        if _PASSWORD_FILE.exists():
+            data = json.loads(_PASSWORD_FILE.read_text())
+            if data.get("hash") and data.get("salt"):
+                return data
+    except (OSError, json.JSONDecodeError):
+        pass
+    return None
+
+
+def _save_password(password: str) -> None:
+    """Hash and persist admin password to disk."""
+    hashed, salt = _hash_password(password)
+    _PASSWORD_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _PASSWORD_FILE.write_text(json.dumps({"hash": hashed, "salt": salt}) + "\n")
+    _PASSWORD_FILE.chmod(0o600)
+
+
+def _verify_password(password: str) -> bool:
+    """Verify a password against the stored hash. Returns True if correct."""
+    stored = _load_saved_password()
+    if not stored:
+        return True
+    hashed, _ = _hash_password(password, stored["salt"])
+    return secrets.compare_digest(hashed, stored["hash"])
+
+
+def _delete_saved_password() -> bool:
+    """Remove persisted password. Returns True if a file was deleted."""
+    try:
+        if _PASSWORD_FILE.exists():
+            _PASSWORD_FILE.unlink()
+            return True
+    except OSError:
+        pass
+    return False
+
+
+def _prompt_admin_password() -> bool:
+    """Prompt user for admin password at startup. Returns True if auth succeeds."""
+    stored = _load_saved_password()
+    if not stored:
+        return True
+
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        try:
+            pwd = getpass.getpass(f"Admin password ({attempt}/{max_attempts}): ")
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[red]Authentication cancelled.[/red]")
+            return False
+
+        if _verify_password(pwd):
+            return True
+        remaining = max_attempts - attempt
+        if remaining > 0:
+            console.print(f"[red]Incorrect password.[/red] {remaining} attempt(s) remaining.")
+        else:
+            console.print("[red]Too many failed attempts. Access denied.[/red]")
+    return False
+
+
 class InteractiveSession:
     """Stateful interactive CLI session."""
 
@@ -188,6 +269,8 @@ class InteractiveSession:
     # ── Main loop ───────────────────────────────────────────────
 
     def run(self) -> int:
+        if not _prompt_admin_password():
+            return 1
         self._print_banner()
         while True:
             try:
@@ -225,12 +308,18 @@ class InteractiveSession:
         else:
             token_line = "\n[yellow]Token: not set — use [bold]set token <value>[/bold] to persist one[/yellow]"
 
+        # Password status line
+        if _load_saved_password():
+            password_line = "\n[green]Password: protected[/green]"
+        else:
+            password_line = "\n[dim]Password: not set — use [bold]password set[/bold] to enable protection[/dim]"
+
         console.print(Panel(
             "[bold cyan]Issue Finder[/bold cyan] — Interactive Mode\n"
             "[dim]PR Writer HFI Project[/dim]\n\n"
             "Type [bold]help[/bold] for available commands.\n"
             "[dim]Press [bold]ESC[/bold] or [bold]Ctrl+C[/bold] to cancel any running operation.[/dim]"
-            + token_line + extra,
+            + token_line + password_line + extra,
             border_style="cyan",
             expand=False,
         ))
@@ -257,6 +346,7 @@ class InteractiveSession:
             "set":      self._cmd_set,
             "unset":    self._cmd_unset,
             "update":   self._cmd_update,
+            "password": self._cmd_password,
             "settings": self._cmd_settings,
             "clear":    self._cmd_clear,
             "clean":    self._cmd_clean,
@@ -558,13 +648,19 @@ class InteractiveSession:
     def _cmd_set(self, args: str):
         parts = args.split(maxsplit=1)
         if len(parts) < 2:
+            if parts and parts[0].lower().replace("_", "-") == "password":
+                self._set_password_interactive()
+                return
             console.print("[yellow]Usage:[/yellow] set <key> <value>")
-            console.print("[dim]  Keys: token, min-stars, max-repos, max-issues, min-score, concurrency[/dim]")
+            console.print("[dim]  Keys: token, password, min-stars, max-repos, max-issues, min-score, concurrency[/dim]")
             return
         key = parts[0].lower().replace("_", "-")
         val = parts[1]
         try:
-            if key == "token":
+            if key == "password":
+                self._set_password_interactive()
+                return
+            elif key == "token":
                 self._apply_token(val)
                 _save_token(val)
                 self._token_source = "saved"
@@ -602,7 +698,7 @@ class InteractiveSession:
     def _cmd_unset(self, args: str):
         key = args.strip().lower().replace("_", "-")
         if not key:
-            console.print("[yellow]Usage:[/yellow] unset token")
+            console.print("[yellow]Usage:[/yellow] unset token | unset password")
             return
         if key == "token":
             self._apply_token(None)
@@ -612,15 +708,23 @@ class InteractiveSession:
                 console.print("[green]Token removed from session and deleted from disk.[/green]")
             else:
                 console.print("[green]Token removed from session.[/green] [dim](no saved token on disk)[/dim]")
+        elif key == "password":
+            self._remove_password_interactive()
         else:
-            console.print(f"[red]Cannot unset: {key}[/red] [dim](only 'token' is supported)[/dim]")
+            console.print(f"[red]Cannot unset: {key}[/red] [dim](supported: token, password)[/dim]")
 
     def _cmd_update(self, args: str):
         parts = args.split(maxsplit=1)
-        if len(parts) < 2:
-            console.print("[yellow]Usage:[/yellow] update token <new_value>")
+        if not parts:
+            console.print("[yellow]Usage:[/yellow] update token <new_value> | update password")
             return
         key = parts[0].lower().replace("_", "-")
+        if key == "password":
+            self._change_password_interactive()
+            return
+        if len(parts) < 2:
+            console.print("[yellow]Usage:[/yellow] update token <new_value> | update password")
+            return
         if key == "token":
             val = parts[1]
             self._apply_token(val)
@@ -630,6 +734,132 @@ class InteractiveSession:
         else:
             console.print(f"[dim]Tip: use [bold]set {key} <value>[/bold] instead.[/dim]")
             self._cmd_set(args)
+
+    def _cmd_password(self, args: str):
+        """Manage admin password: set, change, or remove."""
+        action = args.strip().lower() if args else ""
+
+        if action in ("set", "new"):
+            self._set_password_interactive()
+        elif action in ("change", "update"):
+            self._change_password_interactive()
+        elif action in ("remove", "delete", "unset"):
+            self._remove_password_interactive()
+        elif action == "status":
+            if _load_saved_password():
+                console.print("[green]Admin password is set.[/green]")
+                console.print(f"[dim]  Stored in {_PASSWORD_FILE}[/dim]")
+            else:
+                console.print("[yellow]No admin password set.[/yellow]")
+        else:
+            has_pw = _load_saved_password() is not None
+            console.print("[bold cyan]Admin Password Management[/bold cyan]")
+            console.print(f"  Status: {'[green]set[/green]' if has_pw else '[yellow]not set[/yellow]'}")
+            console.print()
+            console.print("[yellow]Usage:[/yellow]")
+            console.print("  password set       Set a new admin password")
+            console.print("  password change    Change existing password")
+            console.print("  password remove    Remove password protection")
+            console.print("  password status    Check if password is set")
+            console.print()
+            console.print("[dim]When set, the password is required to start interactive mode.[/dim]")
+
+    def _set_password_interactive(self):
+        """Prompt the user to set a new admin password."""
+        if _load_saved_password():
+            console.print("[yellow]A password is already set. Use [bold]password change[/bold] to update it.[/yellow]")
+            return
+
+        try:
+            pw1 = getpass.getpass("New admin password: ")
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[dim]Cancelled.[/dim]")
+            return
+
+        if not pw1:
+            console.print("[red]Password cannot be empty.[/red]")
+            return
+
+        if len(pw1) < 4:
+            console.print("[red]Password must be at least 4 characters.[/red]")
+            return
+
+        try:
+            pw2 = getpass.getpass("Confirm password: ")
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[dim]Cancelled.[/dim]")
+            return
+
+        if pw1 != pw2:
+            console.print("[red]Passwords do not match.[/red]")
+            return
+
+        _save_password(pw1)
+        console.print("[green]Admin password set and saved.[/green]")
+        console.print(f"[dim]  Stored in {_PASSWORD_FILE}[/dim]")
+        console.print("[dim]  You will be prompted on next startup.[/dim]")
+
+    def _change_password_interactive(self):
+        """Prompt the user to change their admin password (requires current password)."""
+        if not _load_saved_password():
+            console.print("[yellow]No password is currently set. Use [bold]password set[/bold] to create one.[/yellow]")
+            return
+
+        try:
+            current = getpass.getpass("Current password: ")
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[dim]Cancelled.[/dim]")
+            return
+
+        if not _verify_password(current):
+            console.print("[red]Incorrect current password.[/red]")
+            return
+
+        try:
+            pw1 = getpass.getpass("New password: ")
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[dim]Cancelled.[/dim]")
+            return
+
+        if not pw1:
+            console.print("[red]Password cannot be empty.[/red]")
+            return
+
+        if len(pw1) < 4:
+            console.print("[red]Password must be at least 4 characters.[/red]")
+            return
+
+        try:
+            pw2 = getpass.getpass("Confirm new password: ")
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[dim]Cancelled.[/dim]")
+            return
+
+        if pw1 != pw2:
+            console.print("[red]Passwords do not match.[/red]")
+            return
+
+        _save_password(pw1)
+        console.print("[green]Admin password changed successfully.[/green]")
+
+    def _remove_password_interactive(self):
+        """Remove the admin password (requires current password)."""
+        if not _load_saved_password():
+            console.print("[yellow]No admin password is set.[/yellow]")
+            return
+
+        try:
+            current = getpass.getpass("Current password (to confirm removal): ")
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[dim]Cancelled.[/dim]")
+            return
+
+        if not _verify_password(current):
+            console.print("[red]Incorrect password. Removal denied.[/red]")
+            return
+
+        _delete_saved_password()
+        console.print("[green]Admin password removed. No password required on next startup.[/green]")
 
     def _cmd_settings(self, _args: str):
         tbl = Table(title="Settings", show_header=True)
@@ -649,6 +879,11 @@ class InteractiveSession:
             tbl.add_row("token", f"[green]✓ {masked}[/green] [dim]({src})[/dim]")
         else:
             tbl.add_row("token", "[red]✗ not set[/red]")
+
+        if _load_saved_password():
+            tbl.add_row("password", "[green]✓ set[/green]")
+        else:
+            tbl.add_row("password", "[dim]not set[/dim]")
 
         tbl.add_row("profile", f"{self.profile.name} — {self.profile.description}")
         tbl.add_row("concurrency", str(self.concurrency))
@@ -1091,6 +1326,12 @@ class InteractiveSession:
             ("unset token",           "Remove token from session and disk"),
             ("set <key> <value>",     "Change setting (concurrency, min-stars, etc.)"),
             ("settings",               "Show current settings"),
+            ("─── Admin Password ───",  "─────────────────────────────────────"),
+            ("password",              "Show password management help"),
+            ("password set",          "Set an admin password"),
+            ("password change",       "Change your admin password"),
+            ("password remove",       "Remove password protection"),
+            ("password status",       "Check if password is set"),
             ("exclude <file>",        "Load excluded-issues file"),
             ("clear",                  "Clear cached results"),
             ("clean",                  "Clear the terminal screen"),
